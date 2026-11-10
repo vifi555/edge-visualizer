@@ -27,6 +27,15 @@ pub struct Settings {
     pub rgb_sensitivity: f32, // 0..1, higher = more beats
     pub rgb_corsair: bool,
     pub rgb_steelseries: bool,
+    pub bar_style: String, // bars | rounded | dots | line
+    pub fx_peaks: bool,    // little caps that fall slowly
+    pub fx_glow: f32,      // 0..1 beat glow around the screen
+    pub fx_shake: f32,     // 0..1 bass shake
+    pub fx_glitch: f32,    // 0..1 RGB split on the beat
+    pub fx_particles: f32, // 0..1 sparks from the bars
+    pub fx_trails: f32,    // 0..1 afterglow trails
+    pub circle_spin: f32,  // -1..1 rotation speed
+    pub circle_zoom: f32,  // 0..1 bass punch
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -68,6 +77,15 @@ impl Default for Settings {
             rgb_sensitivity: 0.5,
             rgb_corsair: true,
             rgb_steelseries: true,
+            bar_style: "bars".into(),
+            fx_peaks: false,
+            fx_glow: 0.0,
+            fx_shake: 0.0,
+            fx_glitch: 0.0,
+            fx_particles: 0.0,
+            fx_trails: 0.0,
+            circle_spin: 0.0,
+            circle_zoom: 0.0,
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -165,6 +183,18 @@ impl Settings {
             self.rgb_color = "#ffffff".into();
         }
         self.rgb_sensitivity = self.rgb_sensitivity.clamp(0.0, 1.0);
+        pick(&mut self.bar_style, &["bars", "rounded", "dots", "line"], "bars");
+        for v in [
+            &mut self.fx_glow,
+            &mut self.fx_shake,
+            &mut self.fx_glitch,
+            &mut self.fx_particles,
+            &mut self.circle_zoom,
+        ] {
+            *v = v.clamp(0.0, 1.0);
+        }
+        self.fx_trails = self.fx_trails.clamp(0.0, 0.9);
+        self.circle_spin = self.circle_spin.clamp(-1.0, 1.0);
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);

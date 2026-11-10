@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod fx;
 mod lyrics;
 mod media;
 mod overlay;

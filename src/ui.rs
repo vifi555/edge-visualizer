@@ -422,6 +422,32 @@ impl eframe::App for App {
                     );
                 });
 
+                card(ui, "EFFECTS", |ui| {
+                    combo(
+                        ui,
+                        "Bar style",
+                        &mut s.bar_style,
+                        &[("bars", "Bars"), ("rounded", "Rounded"), ("dots", "Dots (LED meter)"), ("line", "Line (wave)")],
+                    );
+                    toggle(ui, "Peak caps", &mut s.fx_peaks);
+                    let off_pct = |x: f64| if x < 0.01 { "Off".to_string() } else { pct(x) };
+                    slider(ui, "Beat glow (screen edges light up)", &mut s.fx_glow, 0.0..=1.0, off_pct);
+                    slider(ui, "Bass shake", &mut s.fx_shake, 0.0..=1.0, off_pct);
+                    slider(ui, "RGB split glitch", &mut s.fx_glitch, 0.0..=1.0, off_pct);
+                    slider(ui, "Particles", &mut s.fx_particles, 0.0..=1.0, off_pct);
+                    slider(ui, "Afterglow trails", &mut s.fx_trails, 0.0..=0.9, off_pct);
+                    slider(ui, "Circle spin", &mut s.circle_spin, -1.0..=1.0, |x| {
+                        if x.abs() < 0.02 { "Off".into() } else if x > 0.0 { format!("→ {:.0}%", x * 100.0) } else { format!("← {:.0}%", -x * 100.0) }
+                    });
+                    slider(ui, "Circle bass zoom", &mut s.circle_zoom, 0.0..=1.0, off_pct);
+                    slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
+                    ui.label(
+                        RichText::new("Beat effects react to kick drums. Beat glow and glitch flash on the beat: turn them down if flashing bothers you.")
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                });
+
                 let rgb_status = self.status.rgb.clone();
                 card(ui, "RGB SYNC (KEYBOARD & MOUSE)", |ui| {
                     toggle(ui, "Flash RGB on the beat", &mut s.rgb_enabled);
@@ -431,7 +457,6 @@ impl eframe::App for App {
                         if !s.rgb_follow {
                             color_row(ui, "Flash color", &mut s.rgb_color);
                         }
-                        slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
                         toggle(ui, "Corsair (iCUE)", &mut s.rgb_corsair);
                         toggle(ui, "SteelSeries (GG)", &mut s.rgb_steelseries);
                         let text = if rgb_status.is_empty() { "Connecting…".to_string() } else { rgb_status.clone() };

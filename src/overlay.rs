@@ -4,8 +4,10 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use std::cell::Cell;
 use windows::core::{w, Interface, Result, HSTRING, PCWSTR};
-use windows::Foundation::Numerics::Matrix3x2;
+
+use windows::Foundation::Numerics::{Matrix3x2, Vector2};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -21,6 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::fx::{Fx, Tip};
 use crate::lyrics::{Lyrics, LyricsState};
 use crate::media::{self, Track};
 use crate::settings::{self, Settings, Status};
@@ -202,9 +205,23 @@ struct Gfx {
     _comp: (IDCompositionDevice, IDCompositionTarget, IDCompositionVisual),
     brush: ID2D1SolidColorBrush,
     blur: ID2D1Effect,
+    red: ID2D1Effect,  // RGB split: red channel only
+    blue: ID2D1Effect, // RGB split: blue channel only
+    round: ID2D1StrokeStyle1,
+    trails: RefCell<[Option<ID2D1Bitmap1>; 2]>,
+    trail_idx: Cell<usize>,
+    trail_fresh: Cell<bool>,
     dwrite: IDWriteFactory,
     w: f32,
     h: f32,
+}
+
+/// Colour matrix (5 rows x 4) keeping one channel, for the RGB split glitch.
+fn channel_matrix(channel: usize) -> Vec<u8> {
+    let mut m = [0.0f32; 20];
+    m[channel * 4 + channel] = 1.0; // keep r or b
+    m[3 * 4 + 3] = 0.8; // keep most of the alpha
+    m.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 impl Gfx {
@@ -279,6 +296,31 @@ impl Gfx {
                 D2D1_PROPERTY_TYPE_ENUM,
                 &0u32.to_le_bytes(),
             );
+            let red = dc.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+            red.SetValue(
+                D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                D2D1_PROPERTY_TYPE_MATRIX_5X4,
+                &channel_matrix(0),
+            )?;
+            let blue = dc.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+            blue.SetValue(
+                D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                D2D1_PROPERTY_TYPE_MATRIX_5X4,
+                &channel_matrix(2),
+            )?;
+            let round = factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES1 {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 1.0,
+                    dashStyle: D2D1_DASH_STYLE_SOLID,
+                    dashOffset: 0.0,
+                    transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+                },
+                None,
+            )?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
 
             let mut g = Gfx {
@@ -288,6 +330,12 @@ impl Gfx {
                 _comp: (comp, ctarget, visual),
                 brush,
                 blur,
+                red,
+                blue,
+                round,
+                trails: RefCell::new([None, None]),
+                trail_idx: Cell::new(0),
+                trail_fresh: Cell::new(true),
                 dwrite,
                 w: w as f32,
                 h: h as f32,
@@ -318,6 +366,8 @@ impl Gfx {
     fn resize(&mut self, w: u32, h: u32) -> Result<()> {
         unsafe {
             self.target = None;
+            *self.trails.borrow_mut() = [None, None];
+            self.trail_fresh.set(true);
             self.dc.SetTarget(None::<&ID2D1Image>);
             self.swap
                 .ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))?;
@@ -355,7 +405,8 @@ impl Gfx {
         }
     }
 
-    fn draw_edge(&self, cur: &[f32], s: &Settings, t: f32) {
+    /// Bars around the screen edges, in the chosen style. Records each bar's tip for particles.
+    fn draw_edge(&self, cur: &[f32], s: &Settings, t: f32, peaks: &[f32], tips: &mut Vec<Tip>) {
         let (w, h) = (self.w, self.h);
         // Path the bars follow: (start x, start y, direction x, direction y, length, side).
         // Bass sits where the path starts and ends, highs in the middle (mirrored).
@@ -382,13 +433,12 @@ impl Gfx {
         let step = total / m as f32;
         let bw = (step * 0.62).max(2.0);
         let max_len = w.min(h) * 0.11 * s.size;
+        let line_w = (w.min(h) / 360.0).max(1.5);
         let pal = palette(s, false);
+        let mut prev: Option<(f32, f32)> = None;
         for i in 0..m {
             let k = if i < n { i } else { m - 1 - i };
             let len = cur[k] * max_len;
-            if len < 0.5 {
-                continue;
-            }
             let mut d = (i as f32 + 0.5) * step;
             let mut seg = path[path.len() - 1];
             for p in &path {
@@ -400,45 +450,141 @@ impl Gfx {
             }
             let d = d.min(seg.4);
             let (x, y) = (seg.0 + seg.2 * d, seg.1 + seg.3 * d);
-            let r = match seg.5 {
-                0 => rect(x - bw / 2.0, h - len, x + bw / 2.0, h),
-                1 => rect(0.0, y - bw / 2.0, len, y + bw / 2.0),
-                2 => rect(x - bw / 2.0, 0.0, x + bw / 2.0, len),
-                _ => rect(w - len, y - bw / 2.0, w, y + bw / 2.0),
+            // where the bar starts and which way it grows
+            let (bx, by, dx, dy) = match seg.5 {
+                0 => (x, h, 0.0, -1.0),
+                1 => (0.0, y, 1.0, 0.0),
+                2 => (x, 0.0, 0.0, 1.0),
+                _ => (w, y, -1.0, 0.0),
+            };
+            let c = bar_color(&pal, t, x - w / 2.0, y - h / 2.0);
+            let tip = (bx + dx * len, by + dy * len);
+            tips.push(Tip {
+                x: tip.0,
+                y: tip.1,
+                dx,
+                dy,
+                color: (c.r, c.g, c.b),
+                level: cur[k],
+            });
+            // rectangle covering distance a..b along the bar
+            let part = |a: f32, b: f32| {
+                let (x0, y0, x1, y1) = (bx + dx * a, by + dy * a, bx + dx * b, by + dy * b);
+                if dx == 0.0 {
+                    rect(bx - bw / 2.0, y0.min(y1), bx + bw / 2.0, y0.max(y1))
+                } else {
+                    rect(x0.min(x1), by - bw / 2.0, x0.max(x1), by + bw / 2.0)
+                }
             };
             unsafe {
-                self.brush.SetColor(&bar_color(&pal, t, x - w / 2.0, y - h / 2.0));
-                self.dc.FillRectangle(&r, &self.brush);
+                self.brush.SetColor(&c);
+                match s.bar_style.as_str() {
+                    "line" => {
+                        if let Some(p) = prev {
+                            self.dc.DrawLine(pt(p.0, p.1), pt(tip.0, tip.1), &self.brush, line_w, &self.round);
+                        }
+                        prev = Some(tip);
+                    }
+                    _ if len < 0.5 => {}
+                    "rounded" => {
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: part(0.0, len),
+                            radiusX: bw / 2.0,
+                            radiusY: bw / 2.0,
+                        };
+                        self.dc.FillRoundedRectangle(&rr, &self.brush);
+                    }
+                    "dots" => {
+                        let (dot, gap) = (bw, bw * 0.45);
+                        let mut a = 0.0;
+                        while a + dot <= len.max(dot) {
+                            self.dc.FillRectangle(&part(a, a + dot), &self.brush);
+                            a += dot + gap;
+                        }
+                    }
+                    _ => self.dc.FillRectangle(&part(0.0, len), &self.brush),
+                }
+                if s.fx_peaks && s.bar_style != "line" {
+                    let pk = peaks.get(k).copied().unwrap_or(0.0) * max_len;
+                    if pk > 1.0 {
+                        let th = (bw * 0.35).max(2.0);
+                        self.dc.FillRectangle(&part(pk + bw * 0.4, pk + bw * 0.4 + th), &self.brush);
+                    }
+                }
             }
         }
     }
 
-    fn draw_circle(&self, cur: &[f32], bass: f32, s: &Settings, t: f32) {
+    /// The round visualizer in the middle.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_circle(&self, cur: &[f32], bass: f32, s: &Settings, t: f32, peaks: &[f32], fx: (f32, f32), tips: &mut Vec<Tip>) {
+        let (spin, punch) = fx;
         let n = cur.len();
         let m = n * 2;
         let (cx, cy) = (self.w / 2.0, self.h / 2.0);
         let min = self.w.min(self.h);
-        let r = min * 0.17 * s.size * (1.0 + 0.06 * bass);
+        let r = min * 0.17 * s.size * (1.0 + 0.06 * bass + 0.25 * punch);
         let max_len = min * 0.16 * s.size;
         let bw = (std::f32::consts::TAU * r / m as f32 * 0.6).max(1.5);
+        let line_w = (min / 360.0).max(1.5);
         let pal = palette(s, true);
+        let mut first: Option<(f32, f32)> = None;
+        let mut prev: Option<(f32, f32)> = None;
         unsafe {
             for i in 0..m {
                 let k = if i < n { i } else { m - 1 - i };
                 let len = cur[k] * max_len;
-                if len < 0.5 {
-                    continue;
-                }
-                let a = std::f32::consts::FRAC_PI_2 + (i as f32 + 0.5) / m as f32 * std::f32::consts::TAU;
+                let a = std::f32::consts::FRAC_PI_2 + spin + (i as f32 + 0.5) / m as f32 * std::f32::consts::TAU;
                 let (c, sn) = (a.cos(), a.sin());
-                self.brush.SetColor(&bar_color(&pal, t, c, sn));
-                self.dc.DrawLine(
-                    pt(cx + c * r, cy + sn * r),
-                    pt(cx + c * (r + len), cy + sn * (r + len)),
-                    &self.brush,
-                    bw,
-                    None::<&ID2D1StrokeStyle>,
-                );
+                let at = |d: f32| pt(cx + c * (r + d), cy + sn * (r + d));
+                let col_ = bar_color(&pal, t, c, sn);
+                let tip = (cx + c * (r + len), cy + sn * (r + len));
+                tips.push(Tip {
+                    x: tip.0,
+                    y: tip.1,
+                    dx: c,
+                    dy: sn,
+                    color: (col_.r, col_.g, col_.b),
+                    level: cur[k],
+                });
+                self.brush.SetColor(&col_);
+                match s.bar_style.as_str() {
+                    "line" => {
+                        if let Some(p) = prev {
+                            self.dc.DrawLine(pt(p.0, p.1), pt(tip.0, tip.1), &self.brush, line_w, &self.round);
+                        }
+                        first.get_or_insert(tip);
+                        prev = Some(tip);
+                    }
+                    _ if len < 0.5 => {}
+                    "rounded" => self.dc.DrawLine(at(0.0), at(len), &self.brush, bw, &self.round),
+                    "dots" => {
+                        let (dot, gap) = (bw, bw * 0.45);
+                        let mut d = 0.0;
+                        while d + dot <= len.max(dot) {
+                            self.dc.DrawLine(at(d), at(d + dot), &self.brush, bw, None::<&ID2D1StrokeStyle>);
+                            d += dot + gap;
+                        }
+                    }
+                    _ => self.dc.DrawLine(at(0.0), at(len), &self.brush, bw, None::<&ID2D1StrokeStyle>),
+                }
+                if s.fx_peaks && s.bar_style != "line" {
+                    let pk = peaks.get(k).copied().unwrap_or(0.0) * max_len;
+                    if pk > 1.0 {
+                        let th = (bw * 0.35).max(2.0);
+                        self.dc.DrawLine(
+                            at(pk + bw * 0.4),
+                            at(pk + bw * 0.4 + th),
+                            &self.brush,
+                            bw,
+                            None::<&ID2D1StrokeStyle>,
+                        );
+                    }
+                }
+            }
+            if let (Some(a), Some(b)) = (prev, first) {
+                self.dc.DrawLine(pt(a.0, a.1), pt(b.0, b.1), &self.brush, line_w, &self.round);
+                // close the loop
             }
             let level = (bass * 2.5).min(1.0);
             if level > 0.02 {
@@ -452,6 +598,78 @@ impl Gfx {
                 self.dc.DrawEllipse(&e, &self.brush, 3.0, None::<&ID2D1StrokeStyle>);
                 self.brush.SetOpacity(s.opacity);
             }
+        }
+    }
+
+    /// Sparks flying out from the bars.
+    fn draw_particles(&self, fx: &Fx, s: &Settings) {
+        unsafe {
+            for p in &fx.particles {
+                let a = (p.life / p.max_life).clamp(0.0, 1.0);
+                self.brush.SetColor(&col(p.color.0, p.color.1, p.color.2, a * s.opacity));
+                let e = D2D1_ELLIPSE {
+                    point: pt(p.x, p.y),
+                    radiusX: p.size * (0.5 + 0.5 * a),
+                    radiusY: p.size * (0.5 + 0.5 * a),
+                };
+                self.dc.FillEllipse(&e, &self.brush);
+            }
+        }
+    }
+
+    /// Soft coloured glow around the whole screen edge, on the beat.
+    fn draw_beat_glow(&self, strength: f32, c: D2D1_COLOR_F) -> Result<()> {
+        unsafe {
+            let rt: &ID2D1RenderTarget = &self.dc;
+            let stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: col(c.r, c.g, c.b, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.6,
+                    color: col(c.r, c.g, c.b, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: col(c.r, c.g, c.b, 0.55 * strength),
+                },
+            ];
+            let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                center: pt(self.w / 2.0, self.h / 2.0),
+                gradientOriginOffset: pt(0.0, 0.0),
+                radiusX: self.w * 0.72,
+                radiusY: self.h * 0.72,
+            };
+            let brush = rt.CreateRadialGradientBrush(&props, None, &coll)?;
+            rt.FillRectangle(&rect(0.0, 0.0, self.w, self.h), &brush);
+        }
+        Ok(())
+    }
+
+    /// Full-screen bitmap for the afterglow trails (made the first time they're used).
+    fn trail_bitmap(&self) -> Result<ID2D1Bitmap1> {
+        unsafe {
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                ..Default::default()
+            };
+            self.dc.CreateBitmap(
+                D2D_SIZE_U {
+                    width: self.w as u32,
+                    height: self.h as u32,
+                },
+                None,
+                0,
+                &props,
+            )
         }
     }
 }
@@ -631,33 +849,81 @@ fn draw_toast(g: &Gfx, toast: &mut Toast, dpi: f32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- one frame
-fn render(g: &Gfx, an: &Analyzer, s: &Settings, t: f32, dpi: f32, ts: &mut TextState, toast: &mut Toast) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn render(
+    g: &Gfx,
+    an: &Analyzer,
+    s: &Settings,
+    t: f32,
+    dt: f32,
+    dpi: f32,
+    ts: &mut TextState,
+    toast: &mut Toast,
+    fx: &mut Fx,
+    use_trails: bool,
+) -> Result<()> {
     unsafe {
         let clear = col(0.0, 0.0, 0.0, 0.0);
-        // Pass 1: bars + text into a command list (so we can blur it for the glow)
+        // Pass 1: bars + particles + text into a command list (so we can blur it for the glow)
         let scene = g.dc.CreateCommandList()?;
         g.dc.SetTarget(&scene);
         g.dc.BeginDraw();
         g.dc.Clear(Some(&clear));
         g.brush.SetOpacity(s.opacity);
+        fx.tips.clear();
         if !an.cur.is_empty() {
             if s.mode != "circle" {
-                g.draw_edge(&an.cur, s, t);
+                g.draw_edge(&an.cur, s, t, &fx.peaks, &mut fx.tips);
             }
             if s.mode != "edge" {
-                g.draw_circle(&an.cur, an.bass(), s, t);
+                g.draw_circle(&an.cur, an.bass(), s, t, &fx.peaks, (fx.spin, fx.punch), &mut fx.tips);
             }
         }
+        g.brush.SetOpacity(1.0);
+        g.draw_particles(fx, s);
+        g.brush.SetOpacity(s.opacity);
         let text_res = draw_text(g, ts, s, an.bass(), dpi);
         g.dc.EndDraw(None, None)?;
         scene.Close()?;
         text_res?;
 
-        // Pass 2: glow + scene onto the screen
+        // Afterglow trails: last frame (faded) + this frame, in a ping-pong bitmap.
+        let content: ID2D1Image = if use_trails {
+            {
+                let mut bufs = g.trails.borrow_mut();
+                if bufs[0].is_none() || bufs[1].is_none() {
+                    *bufs = [Some(g.trail_bitmap()?), Some(g.trail_bitmap()?)];
+                    g.trail_fresh.set(true);
+                }
+            }
+            let bufs = g.trails.borrow();
+            let i = g.trail_idx.get();
+            let (prev, next) = (bufs[i].as_ref().unwrap(), bufs[1 - i].as_ref().unwrap());
+            g.dc.SetTarget(next);
+            g.dc.BeginDraw();
+            g.dc.Clear(Some(&clear));
+            if !g.trail_fresh.get() {
+                let keep = s.fx_trails.powf((dt * 60.0).clamp(0.2, 5.0));
+                let rt: &ID2D1RenderTarget = &g.dc;
+                rt.DrawBitmap(prev, None, keep, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+            }
+            g.dc.DrawImage(&scene, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            g.dc.EndDraw(None, None)?;
+            g.trail_idx.set(1 - i);
+            g.trail_fresh.set(false);
+            next.cast()?
+        } else {
+            g.trail_fresh.set(true);
+            scene.cast()?
+        };
+
+        // Pass 2: glow + glitch + scene (shaken) onto the screen, then the beat glow
         let target = g.target.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         g.dc.SetTarget(target);
         g.dc.BeginDraw();
         g.dc.Clear(Some(&clear));
+        let (sx, sy) = fx.shake();
+        let off = Vector2 { X: sx, Y: sy };
         if s.glow > 0.5 {
             let sigma = s.glow * 0.5 * dpi;
             g.blur.SetValue(
@@ -667,12 +933,40 @@ fn render(g: &Gfx, an: &Analyzer, s: &Settings, t: f32, dpi: f32, ts: &mut TextS
             )?;
             g.blur.SetInput(0, &scene, true);
             if let Ok(out) = g.blur.GetOutput() {
-                g.dc.DrawImage(&out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                g.dc.DrawImage(
+                    &out,
+                    Some(&off),
+                    None,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                );
             }
         }
-        g.dc.DrawImage(&scene, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        if fx.glitch > 0.01 {
+            let gx = fx.glitch * 14.0 * dpi;
+            for (e, dx) in [(&g.red, -gx), (&g.blue, gx)] {
+                e.SetInput(0, &content, true);
+                if let Ok(out) = e.GetOutput() {
+                    let o = Vector2 { X: sx + dx, Y: sy };
+                    g.dc.DrawImage(&out, Some(&o), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_PLUS);
+                }
+            }
+        }
+        g.dc.DrawImage(
+            &content,
+            Some(&off),
+            None,
+            D2D1_INTERPOLATION_MODE_LINEAR,
+            D2D1_COMPOSITE_MODE_SOURCE_OVER,
+        );
+        let glow_res = if fx.glow > 0.01 {
+            g.draw_beat_glow(fx.glow, glow_color(&palette(s, false), t))
+        } else {
+            Ok(())
+        };
         let toast_res = draw_toast(g, toast, dpi);
         g.dc.EndDraw(None, None)?;
+        glow_res?;
         toast_res?;
         g.swap.Present(1, DXGI_PRESENT(0)).ok()?;
     }
@@ -823,6 +1117,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 
     let rgb = crate::rgb::start();
     let mut beat = BeatDetector::new();
+    let mut fx = Fx::new();
     let mut an = Analyzer::new();
     let mut samples = vec![0.0f32; FFT_SIZE];
     let mut ts = TextState::new();
@@ -1012,7 +1307,8 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 let sr = audio.sample_rate.load(Ordering::Relaxed);
                 audio.ring.lock().unwrap().latest(&mut samples);
                 an.update(&samples, sr, &s, dt);
-                feed_rgb(&rgb, &mut beat, &an, &s, start.elapsed().as_secs_f32(), dt);
+                let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
+                feed_rgb(&rgb, &beat, hit, &s, start.elapsed().as_secs_f32());
                 std::thread::sleep(Duration::from_millis(16));
             } else {
                 std::thread::sleep(Duration::from_millis(50));
@@ -1027,9 +1323,12 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         let sr = audio.sample_rate.load(Ordering::Relaxed);
         audio.ring.lock().unwrap().latest(&mut samples);
         an.update(&samples, sr, &s, dt);
+        // kick drums drive the RGB sync and the screen effects
+        let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
         if s.rgb_enabled {
-            feed_rgb(&rgb, &mut beat, &an, &s, start.elapsed().as_secs_f32(), dt);
+            feed_rgb(&rgb, &beat, hit, &s, start.elapsed().as_secs_f32());
         }
+        fx.update(dt, hit, &an.cur, &s, dpi);
 
         // ---- text
         let (main, sub, lyric) = pick_text(track.as_ref(), &ly, &s);
@@ -1070,7 +1369,8 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         // Sleep when silent: nothing on screen changes, so don't redraw it.
         let bars_max = an.cur.iter().fold(0.0f32, |a, &b| a.max(b));
         let text_steady = ts.vis == 0.0 || (ts.vis == 1.0 && ts.changed.elapsed() > Duration::from_millis(400));
-        let idle = bars_max < 0.003 && text_steady && toast.until <= Instant::now();
+        let idle = bars_max < 0.003 && text_steady && toast.until <= Instant::now() && !fx.active();
+        let use_trails = s.fx_trails > 0.01 && !idle;
         if idle && idle_drawn {
             std::thread::sleep(Duration::from_millis(50));
             continue;
@@ -1078,7 +1378,18 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 
         let frame_start = Instant::now();
         if let Some(g) = gfx.as_ref() {
-            if let Err(e) = render(g, &an, &s, start.elapsed().as_secs_f32(), dpi, &mut ts, &mut toast) {
+            if let Err(e) = render(
+                g,
+                &an,
+                &s,
+                start.elapsed().as_secs_f32(),
+                dt,
+                dpi,
+                &mut ts,
+                &mut toast,
+                &mut fx,
+                use_trails,
+            ) {
                 sys::log(&format!("draw failed, restarting graphics: {e}"));
                 gfx = None;
                 ts.main_lay = None;
@@ -1111,8 +1422,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 }
 
 /// Kick detection -> tells the RGB thread how bright to flash and in which colour.
-fn feed_rgb(rgb: &crate::rgb::Rgb, beat: &mut BeatDetector, an: &Analyzer, s: &Settings, t: f32, dt: f32) {
-    let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
+fn feed_rgb(rgb: &crate::rgb::Rgb, beat: &BeatDetector, hit: bool, s: &Settings, t: f32) {
     let color = if s.rgb_follow {
         let c = glow_color(&palette(s, false), t);
         (c.r, c.g, c.b)
