@@ -1,11 +1,15 @@
-# Test builds: any branch except main. Builds the exe and keeps it as a
-# download on the run page. Never publishes a release.
+# Test builds: any branch except main. Builds the exe and saves it as a
+# private DRAFT release called "test-build" (only repo owners can see drafts;
+# the app's auto-updater ignores them). Never publishes anything.
 name: Test build
 
 on:
   push:
     branches-ignore: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,3 +26,14 @@ jobs:
           name: edge-visualizer-test
           path: target/release/edge-visualizer.exe
           retention-days: 7
+      - name: Save as private draft (not published)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/edge-visualizer.exe "Edge Visualizer TEST.exe"
+          for id in $(gh api repos/${{ github.repository }}/releases --jq '.[] | select(.draft and .name == "TEST BUILD (not published)") | .id'); do
+            gh api -X DELETE repos/${{ github.repository }}/releases/$id
+          done
+          gh release create "test-${{ github.ref_name }}" "Edge Visualizer TEST.exe" --draft \
+            --title "TEST BUILD (not published)" --notes "Private test build of ${{ github.ref_name }} (${{ github.sha }})."
