@@ -7,6 +7,7 @@ mod overlay;
 mod settings;
 mod sys;
 mod ui;
+mod update;
 mod viz;
 
 fn main() {
@@ -31,17 +32,29 @@ fn main() {
         return;
     }
 
+    // Started by an update: the old version is still closing, so wait for it.
+    let updated = args.windows(2).find(|w| w[0] == "--updated").map(|w| w[1].clone());
+    let mut first = sys::claim("EdgeVisualizer.Overlay");
+    if !first && updated.is_some() {
+        for _ in 0..80 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if sys::claim("EdgeVisualizer.Overlay") {
+                first = true;
+                break;
+            }
+        }
+    }
     // Already running? Just open settings.
-    if !sys::claim("EdgeVisualizer.Overlay") {
+    if !first {
         sys::open_settings();
         return;
     }
 
     sys::reset_log();
-    if !has("--hidden") {
+    if !has("--hidden") && updated.is_none() {
         sys::open_settings();
     }
-    if let Err(e) = overlay::run() {
+    if let Err(e) = overlay::run(updated) {
         let msg = format!("Edge Visualizer stopped:\n\n{e}");
         sys::log(&msg);
         sys::error_box(&msg);

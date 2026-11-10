@@ -43,6 +43,7 @@ struct App {
     status_seen: Option<SystemTime>,
     autostart: bool,
     confirm_reset: bool,
+    update_msg: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl App {
@@ -59,6 +60,7 @@ impl App {
             status_seen: settings::mtime(&settings::status_path()),
             autostart: sys::autostart_on(),
             confirm_reset: false,
+            update_msg: Default::default(),
         }
     }
 
@@ -177,6 +179,30 @@ fn slider<N: egui::emath::Numeric>(
     ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
     ui.add(egui::Slider::new(v, range).trailing_fill(true).custom_formatter(move |x, _| fmt(x)));
     ui.add_space(2.0);
+}
+
+/// "Check for updates" button: installs a newer version and restarts the visualizer.
+fn check_now(msg: std::sync::Arc<std::sync::Mutex<String>>, ctx: egui::Context) {
+    if crate::update::dev_build() {
+        *msg.lock().unwrap() = "Updates are off for test builds (run from the target folder).".into();
+        return;
+    }
+    *msg.lock().unwrap() = "Checking…".into();
+    std::thread::spawn(move || {
+        let text = match crate::update::check_and_install() {
+            Ok(crate::update::Outcome::UpToDate(_)) => "You have the newest version ✓".to_string(),
+            Ok(crate::update::Outcome::Installed(tag)) => {
+                sys::quit_overlay();
+                std::thread::sleep(Duration::from_millis(800));
+                crate::update::launch_updated(&tag);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                format!("Updated to {tag}, restarting…")
+            }
+            Err(e) => e,
+        };
+        *msg.lock().unwrap() = text;
+        ctx.request_repaint();
+    });
 }
 
 fn pct(x: f64) -> String {
@@ -311,12 +337,27 @@ impl eframe::App for App {
 
                 let autostart = &mut self.autostart;
                 let confirm_reset = &mut self.confirm_reset;
+                let update_msg = self.update_msg.clone();
                 card(ui, "GENERAL", |ui| {
                     row(ui, "Start with Windows", |ui| {
                         if ui.checkbox(autostart, "").changed() {
                             sys::set_autostart(*autostart);
                         }
                     });
+                    toggle(ui, "Auto-update", &mut s.auto_update);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Version {}", crate::update::VERSION)).color(MUTED).size(12.5));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let busy = update_msg.lock().unwrap().ends_with('…');
+                            if ui.add_enabled(!busy, egui::Button::new("Check for updates")).clicked() {
+                                check_now(update_msg.clone(), ctx.clone());
+                            }
+                        });
+                    });
+                    let msg = update_msg.lock().unwrap().clone();
+                    if !msg.is_empty() {
+                        ui.label(RichText::new(msg).color(MUTED).size(12.0));
+                    }
                     ui.add_space(4.0);
                     egui::Grid::new("keys").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
                         for (k, d) in [

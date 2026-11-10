@@ -24,6 +24,7 @@ pub struct Settings {
     pub text_offset: f32,
     pub text_font: String, // clean | impact | mono | script
     pub text_pulse: f32,
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +48,7 @@ impl Default for Settings {
             text_offset: 0.0,
             text_font: "clean".into(),
             text_pulse: 0.5,
+            auto_update: true,
         }
     }
 }

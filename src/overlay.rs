@@ -754,7 +754,7 @@ fn cycle(list: &[&str], cur: &str) -> String {
 }
 
 // ---------------------------------------------------------------- main loop
-pub fn run() -> Result<()> {
+pub fn run(updated_to: Option<String>) -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -775,8 +775,12 @@ pub fn run() -> Result<()> {
     let mut an = Analyzer::new();
     let mut samples = vec![0.0f32; FFT_SIZE];
     let mut ts = TextState::new();
+    let restart_to = start_update_checker();
     let mut toast = Toast {
-        text: "Edge Visualizer is running. Click the tray icon for settings.".into(),
+        text: match &updated_to {
+            Some(v) => format!("Updated to {v} ✓"),
+            None => "Edge Visualizer is running. Click the tray icon for settings.".into(),
+        },
         until: Instant::now() + Duration::from_millis(3000),
         lay: None,
     };
@@ -786,7 +790,14 @@ pub fn run() -> Result<()> {
     let mut status = Status::default();
     let mut gfx_error_logged = false;
 
+    let mut restart: Option<String> = None;
     'main: loop {
+        // ---- an update was installed: restart into the new version
+        if let Some(tag) = restart_to.lock().unwrap().take() {
+            restart = Some(tag);
+            break 'main;
+        }
+
         // ---- window messages
         unsafe {
             let mut msg = MSG::default();
@@ -1001,5 +1012,36 @@ pub fn run() -> Result<()> {
         let _ = DestroyWindow(hwnd);
     }
     let _ = std::fs::remove_file(settings::status_path());
+    if let Some(tag) = restart {
+        crate::update::launch_updated(&tag);
+    }
     Ok(())
+}
+
+/// Checks GitHub for a new version shortly after start, then every 6 hours.
+fn start_update_checker() -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
+    let flag = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let f = flag.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        crate::update::cleanup_old();
+        if crate::update::dev_build() {
+            return;
+        }
+        loop {
+            if Settings::load().auto_update {
+                match crate::update::check_and_install() {
+                    Ok(crate::update::Outcome::Installed(tag)) => {
+                        sys::log(&format!("updated to {tag}"));
+                        *f.lock().unwrap() = Some(tag);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => sys::log(&format!("update: {e}")),
+                }
+            }
+            std::thread::sleep(Duration::from_secs(6 * 60 * 60));
+        }
+    });
+    flag
 }

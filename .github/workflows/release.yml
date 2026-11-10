@@ -1,0 +1,54 @@
+# Builds Edge Visualizer and publishes a GitHub release whenever the version
+# in Cargo.toml goes up. To release: bump `version` in Cargo.toml and push.
+name: Build & release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and check if it's already released
+        id: v
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released, nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.v.outputs.exists == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.v.outputs.exists == 'false'
+        uses: Swatinem/rust-cache@v2
+
+      - if: steps.v.outputs.exists == 'false'
+        name: Build
+        run: cargo build --release
+
+      - if: steps.v.outputs.exists == 'false'
+        name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/edge-visualizer.exe "Edge Visualizer.exe"
+          gh release create "v${{ steps.v.outputs.version }}" "Edge Visualizer.exe" \
+            --title "Edge Visualizer ${{ steps.v.outputs.version }}" \
+            --latest \
+            --notes "Download **Edge.Visualizer.exe** below and double-click it. If Windows warns you, click *More info* → *Run anyway*. Already have it? It updates itself."
