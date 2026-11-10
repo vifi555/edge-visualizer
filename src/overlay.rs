@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::cell::Cell;
 use windows::core::{w, Interface, Result, HSTRING, PCWSTR};
 
-use windows::Foundation::Numerics::{Matrix3x2, Vector2};
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -923,7 +923,7 @@ fn render(
         g.dc.BeginDraw();
         g.dc.Clear(Some(&clear));
         let (sx, sy) = fx.shake();
-        let off = Vector2 { X: sx, Y: sy };
+        let off = pt(sx, sy);
         if s.glow > 0.5 {
             let sigma = s.glow * 0.5 * dpi;
             g.blur.SetValue(
@@ -947,7 +947,7 @@ fn render(
             for (e, dx) in [(&g.red, -gx), (&g.blue, gx)] {
                 e.SetInput(0, &content, true);
                 if let Ok(out) = e.GetOutput() {
-                    let o = Vector2 { X: sx + dx, Y: sy };
+                    let o = pt(sx + dx, sy);
                     g.dc.DrawImage(&out, Some(&o), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_PLUS);
                 }
             }
