@@ -1,0 +1,52 @@
+[package]
+name = "edge-visualizer"
+version = "2.0.0"
+edition = "2021"
+description = "Music visualizer bars around the edges of your screen, with synced lyrics"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustfft = "6.2"
+ureq = { version = "2.10", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+  "Foundation",
+  "Foundation_Collections",
+  "Foundation_Numerics",
+  "Media_Control",
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_Media_Audio",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_DirectComposition",
+  "Win32_Graphics_DirectWrite",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_HiDpi",
+]
+
+[build-dependencies]
+embed-resource = "2.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
