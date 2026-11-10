@@ -8,8 +8,18 @@ use std::time::SystemTime;
 pub struct Settings {
     pub visible: bool,
     pub on_top: bool,
-    pub mode: String,  // edge | circle | both
-    pub theme: String, // rainbow | fire | ice | white
+    pub mode: String,         // edge | circle | both
+    pub theme: String,        // old single colour setting, only used to migrate
+    pub edge_theme: String,   // rainbow | fire | ice | white | custom
+    pub circle_theme: String, // rainbow | fire | ice | white | custom
+    pub edge_color_a: String, // custom colours as "#rrggbb"
+    pub edge_color_b: String,
+    pub circle_color_a: String,
+    pub circle_color_b: String,
+    pub text_color: String,
+    pub edges: String,     // all | bottom | sides | topbottom
+    pub fps: u32,          // 0 = match the screen, else a cap
+    pub audio_app: String, // "" = all apps, else an exe name like "spotify.exe"
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -34,6 +44,16 @@ impl Default for Settings {
             on_top: true,
             mode: "edge".into(),
             theme: "rainbow".into(),
+            edge_theme: "rainbow".into(),
+            circle_theme: "rainbow".into(),
+            edge_color_a: "#ff7a1a".into(),
+            edge_color_b: "#b45cff".into(),
+            circle_color_a: "#00e5ff".into(),
+            circle_color_b: "#ff3da0".into(),
+            text_color: "#ffffff".into(),
+            edges: "all".into(),
+            fps: 0,
+            audio_app: String::new(),
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -79,11 +99,18 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 
 impl Settings {
     pub fn load() -> Self {
-        std::fs::read_to_string(settings_path())
-            .ok()
-            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
-            .unwrap_or_default()
-            .clamped()
+        let Some(text) = std::fs::read_to_string(settings_path()).ok() else {
+            return Self::default();
+        };
+        let Ok(mut s) = serde_json::from_str::<Settings>(&text) else {
+            return Self::default();
+        };
+        // Older versions had one "theme" for everything: use it for both parts.
+        if !text.contains("\"edgeTheme\"") {
+            s.edge_theme = s.theme.clone();
+            s.circle_theme = s.theme.clone();
+        }
+        s.clamped()
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -98,7 +125,27 @@ impl Settings {
             }
         };
         pick(&mut self.mode, &["edge", "circle", "both"], "edge");
-        pick(&mut self.theme, &["rainbow", "fire", "ice", "white"], "rainbow");
+        const THEMES: &[&str] = &["rainbow", "fire", "ice", "white", "custom"];
+        pick(&mut self.theme, THEMES, "rainbow");
+        pick(&mut self.edge_theme, THEMES, "rainbow");
+        pick(&mut self.circle_theme, THEMES, "rainbow");
+        pick(&mut self.edges, &["all", "bottom", "sides", "topbottom"], "all");
+        let d = Settings::default();
+        for (v, def) in [
+            (&mut self.edge_color_a, d.edge_color_a),
+            (&mut self.edge_color_b, d.edge_color_b),
+            (&mut self.circle_color_a, d.circle_color_a),
+            (&mut self.circle_color_b, d.circle_color_b),
+            (&mut self.text_color, d.text_color),
+        ] {
+            if parse_hex(v).is_none() {
+                *v = def;
+            }
+        }
+        if !matches!(self.fps, 0 | 30 | 60 | 120 | 144) {
+            self.fps = 0;
+        }
+        self.audio_app = self.audio_app.trim().to_lowercase();
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);
@@ -116,6 +163,20 @@ impl Settings {
     }
 }
 
+/// "#ff7a1a" -> (1.0, 0.48, 0.1)
+pub fn parse_hex(s: &str) -> Option<(f32, f32, f32)> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    Some((
+        ((v >> 16) & 255) as f32 / 255.0,
+        ((v >> 8) & 255) as f32 / 255.0,
+        (v & 255) as f32 / 255.0,
+    ))
+}
+
 /// What's playing, written by the visualizer so the settings window can show it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -123,6 +184,7 @@ pub struct Status {
     pub title: String,
     pub artist: String,
     pub lyrics: String,
+    pub audio_mode: String, // all | isolated | follow | waiting
 }
 
 impl Status {

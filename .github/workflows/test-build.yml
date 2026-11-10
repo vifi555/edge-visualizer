@@ -1,0 +1,24 @@
+# Test builds: any branch except main. Builds the exe and keeps it as a
+# download on the run page. Never publishes a release.
+name: Test build
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Keep the exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-visualizer-test
+          path: target/release/edge-visualizer.exe
+          retention-days: 7

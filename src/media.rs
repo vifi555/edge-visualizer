@@ -29,7 +29,8 @@ pub fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn start() -> Arc<Mutex<Option<Track>>> {
+/// `target` = exe of the app to follow ("" = prefer Spotify, else whatever is playing).
+pub fn start(target: Arc<Mutex<String>>) -> Arc<Mutex<Option<Track>>> {
     let shared = Arc::new(Mutex::new(None));
     let s = shared.clone();
     std::thread::spawn(move || {
@@ -46,7 +47,8 @@ pub fn start() -> Arc<Mutex<Option<Track>>> {
                 }
             };
             loop {
-                let t = read(&mgr).unwrap_or(None);
+                let want = target.lock().unwrap().clone();
+                let t = read(&mgr, &want).unwrap_or(None);
                 *s.lock().unwrap() = t;
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -55,23 +57,29 @@ pub fn start() -> Arc<Mutex<Option<Track>>> {
     shared
 }
 
-fn pick_session(mgr: &GlobalSystemMediaTransportControlsSessionManager) -> Option<GlobalSystemMediaTransportControlsSession> {
+fn pick_session(mgr: &GlobalSystemMediaTransportControlsSessionManager, target: &str) -> Option<GlobalSystemMediaTransportControlsSession> {
+    // "spotify.exe" -> "spotify"; matched against the media session's app id.
+    let want = target.trim_end_matches(".exe").to_string();
+    let prefer = if want.is_empty() { "spotify".to_string() } else { want.clone() };
     if let Ok(list) = mgr.GetSessions() {
         let n = list.Size().unwrap_or(0);
         for i in 0..n {
             if let Ok(s) = list.GetAt(i) {
                 let id = s.SourceAppUserModelId().map(|h| h.to_string()).unwrap_or_default();
-                if id.to_lowercase().contains("spotify") {
+                if id.to_lowercase().contains(&prefer) {
                     return Some(s);
                 }
             }
         }
     }
+    if !want.is_empty() {
+        return None; // a specific app was chosen: don't show another app's song
+    }
     mgr.GetCurrentSession().ok()
 }
 
-fn read(mgr: &GlobalSystemMediaTransportControlsSessionManager) -> windows::core::Result<Option<Track>> {
-    let Some(s) = pick_session(mgr) else { return Ok(None) };
+fn read(mgr: &GlobalSystemMediaTransportControlsSessionManager, target: &str) -> windows::core::Result<Option<Track>> {
+    let Some(s) = pick_session(mgr, target) else { return Ok(None) };
     let props = s.TryGetMediaPropertiesAsync()?.get()?;
     let title = props.Title()?.to_string();
     if title.trim().is_empty() {

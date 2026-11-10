@@ -44,6 +44,7 @@ struct App {
     autostart: bool,
     confirm_reset: bool,
     update_msg: std::sync::Arc<std::sync::Mutex<String>>,
+    apps: Vec<String>,
 }
 
 impl App {
@@ -61,6 +62,7 @@ impl App {
             autostart: sys::autostart_on(),
             confirm_reset: false,
             update_msg: Default::default(),
+            apps: crate::audio::list_apps(),
         }
     }
 
@@ -205,6 +207,43 @@ fn check_now(msg: std::sync::Arc<std::sync::Mutex<String>>, ctx: egui::Context) 
     });
 }
 
+const THEMES: &[(&str, &str)] = &[
+    ("rainbow", "Rainbow"),
+    ("fire", "Fire"),
+    ("ice", "Ice"),
+    ("white", "White"),
+    ("custom", "Custom"),
+];
+
+fn color_row(ui: &mut egui::Ui, label: &str, hex: &mut String) {
+    row(ui, label, |ui| {
+        let (r, g, b) = settings::parse_hex(hex).unwrap_or((1.0, 1.0, 1.0));
+        let mut c = [(r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8];
+        if ui.color_edit_button_srgb(&mut c).changed() {
+            *hex = format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        }
+    });
+}
+
+/// A colour theme picker; "Custom" shows two colour buttons it blends between.
+fn theme_rows(ui: &mut egui::Ui, label: &str, theme: &mut String, a: &mut String, b: &mut String) {
+    combo(ui, label, theme, THEMES);
+    if theme == "custom" {
+        color_row(ui, "      Color 1", a);
+        color_row(ui, "      Color 2", b);
+    }
+}
+
+/// "spotify.exe" -> "Spotify"
+fn pretty_app(exe: &str) -> String {
+    let stem = exe.trim_end_matches(".exe");
+    let mut c = stem.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => exe.to_string(),
+    }
+}
+
 fn pct(x: f64) -> String {
     format!("{:.0}%", x * 100.0)
 }
@@ -227,6 +266,43 @@ impl eframe::App for App {
                 ui.add_space(8.0);
 
                 let s = &mut self.s;
+                let apps = &mut self.apps;
+                let mode = self.status.audio_mode.clone();
+                card(ui, "LISTEN TO", |ui| {
+                    let mut opts: Vec<(String, String)> = vec![(String::new(), "All apps".into())];
+                    for a in apps.iter() {
+                        opts.push((a.clone(), pretty_app(a)));
+                    }
+                    if !s.audio_app.is_empty() && !apps.contains(&s.audio_app) {
+                        opts.push((s.audio_app.clone(), pretty_app(&s.audio_app)));
+                    }
+                    let refs: Vec<(&str, &str)> = opts.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    combo(ui, "App", &mut s.audio_app, &refs);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Only apps making sound right now are listed.").color(MUTED).size(12.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Refresh").clicked() {
+                                *apps = crate::audio::list_apps();
+                            }
+                        });
+                    });
+                    if !s.audio_app.is_empty() {
+                        let app = pretty_app(&s.audio_app);
+                        let (text, color) = match mode.as_str() {
+                            "isolated" => (format!("Only {app}'s sound moves the bars ✓"), GREEN),
+                            "follow" => (
+                                format!("This Windows version can't capture one app on its own, so the bars follow {app}'s volume. Other sounds playing at the same time still mix in."),
+                                WARN,
+                            ),
+                            "waiting" => (format!("{app} isn't running. The bars start when it does."), MUTED),
+                            _ => (String::new(), MUTED),
+                        };
+                        if !text.is_empty() {
+                            ui.label(RichText::new(text).color(color).size(12.0));
+                        }
+                    }
+                });
+
                 card(ui, "VISUALIZER", |ui| {
                     toggle(ui, "Show visualizer", &mut s.visible);
                     toggle(ui, "On top of apps", &mut s.on_top);
@@ -238,10 +314,20 @@ impl eframe::App for App {
                     );
                     combo(
                         ui,
-                        "Colors",
-                        &mut s.theme,
-                        &[("rainbow", "Rainbow"), ("fire", "Fire"), ("ice", "Ice"), ("white", "White")],
+                        "Edges",
+                        &mut s.edges,
+                        &[("all", "All edges"), ("bottom", "Bottom only"), ("sides", "Sides only"), ("topbottom", "Top + bottom")],
                     );
+                    theme_rows(ui, "Edge colors", &mut s.edge_theme, &mut s.edge_color_a, &mut s.edge_color_b);
+                    theme_rows(ui, "Circle colors", &mut s.circle_theme, &mut s.circle_color_a, &mut s.circle_color_b);
+                    row(ui, "FPS limit", |ui| {
+                        let name = |f: u32| if f == 0 { "Match screen".to_string() } else { format!("{f} FPS") };
+                        egui::ComboBox::new("fps", "").selected_text(name(s.fps)).width(180.0).show_ui(ui, |ui| {
+                            for f in [0u32, 144, 120, 60, 30] {
+                                ui.selectable_value(&mut s.fps, f, name(f));
+                            }
+                        });
+                    });
                     ui.add_space(4.0);
                     slider(ui, "Intensity", &mut s.intensity, 0.3..=3.0, pct);
                     slider(ui, "Bar length", &mut s.size, 0.4..=2.5, pct);
@@ -304,6 +390,7 @@ impl eframe::App for App {
                         });
                     ui.add_space(4.0);
 
+                    color_row(ui, "Text color", &mut s.text_color);
                     combo(
                         ui,
                         "Font",

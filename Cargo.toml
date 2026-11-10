@@ -1,6 +1,6 @@
 [package]
 name = "edge-visualizer"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2021"
 description = "Music visualizer bars around the edges of your screen, with synced lyrics"
 
@@ -26,6 +26,7 @@ features = [
   "Win32_System_Variant",
   "Win32_System_LibraryLoader",
   "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_Media_Audio",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Direct2D",

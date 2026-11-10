@@ -130,26 +130,59 @@ fn stops(list: &[u32], f: f32) -> (f32, f32, f32) {
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, a.2 + (b.2 - a.2) * t)
 }
 
+/// Colours for one part (edges or circle).
+struct Palette {
+    theme: String,
+    a: (f32, f32, f32),
+    b: (f32, f32, f32),
+    speed: f32,
+}
+
+fn palette(s: &Settings, circle: bool) -> Palette {
+    let (theme, a, b) = if circle {
+        (&s.circle_theme, &s.circle_color_a, &s.circle_color_b)
+    } else {
+        (&s.edge_theme, &s.edge_color_a, &s.edge_color_b)
+    };
+    Palette {
+        theme: theme.clone(),
+        a: settings::parse_hex(a).unwrap_or((1.0, 1.0, 1.0)),
+        b: settings::parse_hex(b).unwrap_or((1.0, 1.0, 1.0)),
+        speed: s.color_speed,
+    }
+}
+
+fn lerp3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, a.2 + (b.2 - a.2) * t)
+}
+
 /// Colour of a bar from its direction around the screen centre (rotates over time).
-fn bar_color(s: &Settings, t: f32, dx: f32, dy: f32) -> D2D1_COLOR_F {
-    let frac = ((dy.atan2(dx) - t * 0.6 * s.color_speed) / std::f32::consts::TAU).rem_euclid(1.0);
-    let (r, g, b) = match s.theme.as_str() {
+fn bar_color(p: &Palette, t: f32, dx: f32, dy: f32) -> D2D1_COLOR_F {
+    let frac = ((dy.atan2(dx) - t * 0.6 * p.speed) / std::f32::consts::TAU).rem_euclid(1.0);
+    let (r, g, b) = match p.theme.as_str() {
         "fire" => stops(&FIRE, frac),
         "ice" => stops(&ICE, frac),
         "white" => (1.0, 1.0, 1.0),
+        "custom" => lerp3(p.a, p.b, if frac < 0.5 { frac * 2.0 } else { 2.0 - frac * 2.0 }),
         _ => hsl(frac * 360.0, 1.0, 0.6),
     };
     col(r, g, b, 1.0)
 }
 
-fn glow_color(s: &Settings, t: f32) -> D2D1_COLOR_F {
-    let (r, g, b) = match s.theme.as_str() {
+fn glow_color(p: &Palette, t: f32) -> D2D1_COLOR_F {
+    let (r, g, b) = match p.theme.as_str() {
         "fire" => hex(0xff5a00),
         "ice" => hex(0x4aa8ff),
         "white" => (1.0, 1.0, 1.0),
-        _ => hsl(t * 36.0 * s.color_speed, 1.0, 0.6),
+        "custom" => lerp3(p.a, p.b, 0.5 + 0.5 * (t * p.speed).sin()),
+        _ => hsl(t * 36.0 * p.speed, 1.0, 0.6),
     };
     col(r, g, b, 1.0)
+}
+
+/// Does the bottom edge have bars? (then the text sits above them)
+fn bottom_bars(s: &Settings) -> bool {
+    s.mode != "circle" && matches!(s.edges.as_str(), "all" | "bottom" | "topbottom")
 }
 
 fn screen() -> (i32, i32, f32) {
@@ -324,44 +357,57 @@ impl Gfx {
 
     fn draw_edge(&self, cur: &[f32], s: &Settings, t: f32) {
         let (w, h) = (self.w, self.h);
+        // Path the bars follow: (start x, start y, direction x, direction y, length, side).
+        // Bass sits where the path starts and ends, highs in the middle (mirrored).
+        // Side: 0 bottom (grows up), 1 left (grows right), 2 top (grows down), 3 right (grows left).
+        let path: Vec<(f32, f32, f32, f32, f32, u8)> = match s.edges.as_str() {
+            "bottom" => vec![(w / 2.0, h, -1.0, 0.0, w / 2.0, 0), (w, h, -1.0, 0.0, w / 2.0, 0)],
+            "sides" => vec![(0.0, h, 0.0, -1.0, h, 1), (w, 0.0, 0.0, 1.0, h, 3)],
+            "topbottom" => vec![
+                (w / 2.0, h, -1.0, 0.0, w / 2.0, 0),
+                (0.0, 0.0, 1.0, 0.0, w, 2),
+                (w, h, -1.0, 0.0, w / 2.0, 0),
+            ],
+            _ => vec![
+                (w / 2.0, h, -1.0, 0.0, w / 2.0, 0),
+                (0.0, h, 0.0, -1.0, h, 1),
+                (0.0, 0.0, 1.0, 0.0, w, 2),
+                (w, 0.0, 0.0, 1.0, h, 3),
+                (w, h, -1.0, 0.0, w / 2.0, 0),
+            ],
+        };
+        let total: f32 = path.iter().map(|p| p.4).sum();
         let n = cur.len();
         let m = n * 2;
-        let step = 2.0 * (w + h) / m as f32;
+        let step = total / m as f32;
         let bw = (step * 0.62).max(2.0);
         let max_len = w.min(h) * 0.11 * s.size;
+        let pal = palette(s, false);
         for i in 0..m {
             let k = if i < n { i } else { m - 1 - i };
             let len = cur[k] * max_len;
             if len < 0.5 {
                 continue;
             }
-            // distance along the border, starting bottom-centre going left
             let mut d = (i as f32 + 0.5) * step;
-            let r = if d < w / 2.0 {
-                rect(w / 2.0 - d - bw / 2.0, h - len, w / 2.0 - d + bw / 2.0, h)
-            } else {
-                d -= w / 2.0;
-                if d < h {
-                    rect(0.0, h - d - bw / 2.0, len, h - d + bw / 2.0)
-                } else {
-                    d -= h;
-                    if d < w {
-                        rect(d - bw / 2.0, 0.0, d + bw / 2.0, len)
-                    } else {
-                        d -= w;
-                        if d < h {
-                            rect(w - len, d - bw / 2.0, w, d + bw / 2.0)
-                        } else {
-                            d -= h;
-                            rect(w - d - bw / 2.0, h - len, w - d + bw / 2.0, h)
-                        }
-                    }
+            let mut seg = path[path.len() - 1];
+            for p in &path {
+                if d < p.4 {
+                    seg = *p;
+                    break;
                 }
+                d -= p.4;
+            }
+            let d = d.min(seg.4);
+            let (x, y) = (seg.0 + seg.2 * d, seg.1 + seg.3 * d);
+            let r = match seg.5 {
+                0 => rect(x - bw / 2.0, h - len, x + bw / 2.0, h),
+                1 => rect(0.0, y - bw / 2.0, len, y + bw / 2.0),
+                2 => rect(x - bw / 2.0, 0.0, x + bw / 2.0, len),
+                _ => rect(w - len, y - bw / 2.0, w, y + bw / 2.0),
             };
-            let cx = (r.left + r.right) / 2.0 - w / 2.0;
-            let cy = (r.top + r.bottom) / 2.0 - h / 2.0;
             unsafe {
-                self.brush.SetColor(&bar_color(s, t, cx, cy));
+                self.brush.SetColor(&bar_color(&pal, t, x - w / 2.0, y - h / 2.0));
                 self.dc.FillRectangle(&r, &self.brush);
             }
         }
@@ -375,6 +421,7 @@ impl Gfx {
         let r = min * 0.17 * s.size * (1.0 + 0.06 * bass);
         let max_len = min * 0.16 * s.size;
         let bw = (std::f32::consts::TAU * r / m as f32 * 0.6).max(1.5);
+        let pal = palette(s, true);
         unsafe {
             for i in 0..m {
                 let k = if i < n { i } else { m - 1 - i };
@@ -384,7 +431,7 @@ impl Gfx {
                 }
                 let a = std::f32::consts::FRAC_PI_2 + (i as f32 + 0.5) / m as f32 * std::f32::consts::TAU;
                 let (c, sn) = (a.cos(), a.sin());
-                self.brush.SetColor(&bar_color(s, t, c, sn));
+                self.brush.SetColor(&bar_color(&pal, t, c, sn));
                 self.dc.DrawLine(
                     pt(cx + c * r, cy + sn * r),
                     pt(cx + c * (r + len), cy + sn * (r + len)),
@@ -396,7 +443,7 @@ impl Gfx {
             let level = (bass * 2.5).min(1.0);
             if level > 0.02 {
                 self.brush.SetOpacity(s.opacity * level);
-                self.brush.SetColor(&glow_color(s, t));
+                self.brush.SetColor(&glow_color(&pal, t));
                 let e = D2D1_ELLIPSE {
                     point: pt(cx, cy),
                     radiusX: r - 6.0,
@@ -503,7 +550,8 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
         ts.sub_lay = Some((key_sub, l, h));
     }
 
-    let edge = if s.mode != "circle" { g.w.min(g.h) * 0.11 * s.size } else { 0.0 };
+    let edge = if bottom_bars(s) { g.w.min(g.h) * 0.11 * s.size } else { 0.0 };
+    let (tr, tg, tb) = settings::parse_hex(&s.text_color).unwrap_or((1.0, 1.0, 1.0));
     let bottom = (edge + (30.0 + s.text_offset) * dpi).max(0.0);
     let pop = (ts.changed.elapsed().as_secs_f32() / 0.28).min(1.0);
     let y_off = 14.0 * dpi * (1.0 - pop);
@@ -526,7 +574,7 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
                 &g.brush,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
             );
-            g.brush.SetColor(&col(1.0, 1.0, 1.0, a));
+            g.brush.SetColor(&col(tr, tg, tb, a));
             g.dc.DrawTextLayout(pt(x0, top + y_off), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
         }
         if let Some((_, l, _)) = &ts.sub_lay {
@@ -539,7 +587,7 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
                 &g.brush,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
             );
-            g.brush.SetColor(&col(1.0, 1.0, 1.0, a));
+            g.brush.SetColor(&col(tr, tg, tb, a));
             g.dc.DrawTextLayout(pt(x0, y), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
         }
         g.dc.SetTransform(&identity());
@@ -693,10 +741,10 @@ fn tray_menu(hwnd: HWND, s: &Settings) -> u32 {
         add(11, "Circle", s.mode == "circle");
         add(12, "Both", s.mode == "both");
         sep();
-        add(20, "Rainbow", s.theme == "rainbow");
-        add(21, "Fire", s.theme == "fire");
-        add(22, "Ice", s.theme == "ice");
-        add(23, "White", s.theme == "white");
+        add(20, "Rainbow", s.edge_theme == "rainbow");
+        add(21, "Fire", s.edge_theme == "fire");
+        add(22, "Ice", s.edge_theme == "ice");
+        add(23, "White", s.edge_theme == "white");
         sep();
         add(99, "Quit", false);
 
@@ -761,8 +809,9 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
     let mut s = Settings::load();
     let mut s_mtime = settings::mtime(&settings::settings_path());
 
-    let audio = crate::audio::start();
-    let media = media::start();
+    let audio = crate::audio::start(&s.audio_app);
+    let media_target = std::sync::Arc::new(std::sync::Mutex::new(s.audio_app.clone()));
+    let media = media::start(media_target.clone());
     let mut lyrics = Lyrics::new();
 
     let (mut sw, mut sh, mut dpi) = screen();
@@ -789,6 +838,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
     let mut last_poll = Instant::now();
     let mut status = Status::default();
     let mut gfx_error_logged = false;
+    let mut idle_drawn = false; // drew the empty "nothing playing" frame already
 
     let mut restart: Option<String> = None;
     'main: loop {
@@ -859,19 +909,23 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                         changed = true;
                     }
                     20 => {
-                        s.theme = "rainbow".into();
+                        s.edge_theme = "rainbow".into();
+                        s.circle_theme = "rainbow".into();
                         changed = true;
                     }
                     21 => {
-                        s.theme = "fire".into();
+                        s.edge_theme = "fire".into();
+                        s.circle_theme = "fire".into();
                         changed = true;
                     }
                     22 => {
-                        s.theme = "ice".into();
+                        s.edge_theme = "ice".into();
+                        s.circle_theme = "ice".into();
                         changed = true;
                     }
                     23 => {
-                        s.theme = "white".into();
+                        s.edge_theme = "white".into();
+                        s.circle_theme = "white".into();
                         changed = true;
                     }
                     99 => break 'main,
@@ -887,8 +941,9 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                             msg = format!("Style: {}", s.mode);
                         }
                         4 => {
-                            s.theme = cycle(&["rainbow", "fire", "ice", "white"], &s.theme);
-                            msg = format!("Colors: {}", s.theme);
+                            s.edge_theme = cycle(&["rainbow", "fire", "ice", "white"], &s.edge_theme);
+                            s.circle_theme = s.edge_theme.clone();
+                            msg = format!("Colors: {}", s.edge_theme);
                         }
                         5 => s.show_text = !s.show_text,
                         6 | 7 => {
@@ -908,7 +963,10 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 }
             }
         }
+        *audio.target.lock().unwrap() = s.audio_app.clone();
+        *media_target.lock().unwrap() = s.audio_app.clone();
         if changed {
+            idle_drawn = false;
             let _ = s.save();
             s_mtime = settings::mtime(&settings::settings_path());
             apply_window(hwnd, &s, sw, sh);
@@ -924,6 +982,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 if fresh != s {
                     s = fresh;
                     apply_window(hwnd, &s, sw, sh);
+                    idle_drawn = false;
                 }
             }
         }
@@ -935,6 +994,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             title: track.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
             artist: track.as_ref().map(|t| t.artist.clone()).unwrap_or_default(),
             lyrics: ly.status.clone(),
+            audio_mode: audio.mode.lock().unwrap().clone(),
         };
         if new_status != status {
             status = new_status;
@@ -990,6 +1050,15 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 }
             }
         }
+        // Sleep when silent: nothing on screen changes, so don't redraw it.
+        let bars_max = an.cur.iter().fold(0.0f32, |a, &b| a.max(b));
+        let text_steady = ts.vis == 0.0 || (ts.vis == 1.0 && ts.changed.elapsed() > Duration::from_millis(400));
+        let idle = bars_max < 0.003 && text_steady && toast.until <= Instant::now();
+        if idle && idle_drawn {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
         let frame_start = Instant::now();
         if let Some(g) = gfx.as_ref() {
             if let Err(e) = render(g, &an, &s, start.elapsed().as_secs_f32(), dpi, &mut ts, &mut toast) {
@@ -1000,10 +1069,16 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 toast.lay = None;
             }
         }
-        // Present() normally waits for the screen refresh; this is just a safety cap.
+        idle_drawn = idle;
+        // Present() waits for the screen refresh; the FPS setting can cap it lower.
+        let budget = if s.fps > 0 {
+            Duration::from_secs_f32(1.0 / s.fps as f32)
+        } else {
+            Duration::from_millis(4)
+        };
         let spent = frame_start.elapsed();
-        if spent < Duration::from_millis(4) {
-            std::thread::sleep(Duration::from_millis(4) - spent);
+        if spent < budget {
+            std::thread::sleep(budget - spent);
         }
     }
 
