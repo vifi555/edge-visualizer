@@ -422,6 +422,34 @@ impl eframe::App for App {
                     );
                 });
 
+                let rgb_status = self.status.rgb.clone();
+                card(ui, "RGB SYNC (KEYBOARD & MOUSE)", |ui| {
+                    toggle(ui, "Flash RGB on the beat", &mut s.rgb_enabled);
+                    if s.rgb_enabled {
+                        combo(ui, "Effect", &mut s.rgb_effect, &[("flash", "Flash"), ("ripple", "Ripple (per-key keyboards)")]);
+                        toggle(ui, "Match edge colors", &mut s.rgb_follow);
+                        if !s.rgb_follow {
+                            color_row(ui, "Flash color", &mut s.rgb_color);
+                        }
+                        slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
+                        toggle(ui, "Corsair (iCUE)", &mut s.rgb_corsair);
+                        toggle(ui, "SteelSeries (GG)", &mut s.rgb_steelseries);
+                        let text = if rgb_status.is_empty() { "Connecting…".to_string() } else { rgb_status.clone() };
+                        for line in text.lines() {
+                            let color = if line.ends_with('✓') { GREEN } else if line.contains("Connecting") { MUTED } else { WARN };
+                            ui.label(RichText::new(line).color(color).size(12.0));
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Corsair needs iCUE open with third-party control (SDK) turned on in its settings. \
+                                 SteelSeries needs GG open. Your normal lighting comes back between flashes.",
+                            )
+                            .color(MUTED)
+                            .size(12.0),
+                        );
+                    }
+                });
+
                 let autostart = &mut self.autostart;
                 let confirm_reset = &mut self.confirm_reset;
                 let update_msg = self.update_msg.clone();

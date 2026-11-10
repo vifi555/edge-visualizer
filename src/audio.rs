@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use windows::core::{implement, Interface, HRESULT};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};

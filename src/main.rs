@@ -4,6 +4,7 @@ mod audio;
 mod lyrics;
 mod media;
 mod overlay;
+mod rgb;
 mod settings;
 mod sys;
 mod ui;

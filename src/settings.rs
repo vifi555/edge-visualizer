@@ -17,9 +17,16 @@ pub struct Settings {
     pub circle_color_a: String,
     pub circle_color_b: String,
     pub text_color: String,
-    pub edges: String,     // all | bottom | sides | topbottom
-    pub fps: u32,          // 0 = match the screen, else a cap
-    pub audio_app: String, // "" = all apps, else an exe name like "spotify.exe"
+    pub edges: String,        // all | bottom | sides | topbottom
+    pub fps: u32,             // 0 = match the screen, else a cap
+    pub audio_app: String,    // "" = all apps, else an exe name like "spotify.exe"
+    pub rgb_enabled: bool,    // flash keyboard/mouse RGB on the beat
+    pub rgb_effect: String,   // flash | ripple
+    pub rgb_follow: bool,     // use the edge colours instead of rgb_color
+    pub rgb_color: String,    // "#rrggbb"
+    pub rgb_sensitivity: f32, // 0..1, higher = more beats
+    pub rgb_corsair: bool,
+    pub rgb_steelseries: bool,
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -54,6 +61,13 @@ impl Default for Settings {
             edges: "all".into(),
             fps: 0,
             audio_app: String::new(),
+            rgb_enabled: false,
+            rgb_effect: "flash".into(),
+            rgb_follow: true,
+            rgb_color: "#ffffff".into(),
+            rgb_sensitivity: 0.5,
+            rgb_corsair: true,
+            rgb_steelseries: true,
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -146,6 +160,11 @@ impl Settings {
             self.fps = 0;
         }
         self.audio_app = self.audio_app.trim().to_lowercase();
+        pick(&mut self.rgb_effect, &["flash", "ripple"], "flash");
+        if parse_hex(&self.rgb_color).is_none() {
+            self.rgb_color = "#ffffff".into();
+        }
+        self.rgb_sensitivity = self.rgb_sensitivity.clamp(0.0, 1.0);
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);
@@ -185,6 +204,7 @@ pub struct Status {
     pub artist: String,
     pub lyrics: String,
     pub audio_mode: String, // all | isolated | follow | waiting
+    pub rgb: String,        // RGB sync status line
 }
 
 impl Status {

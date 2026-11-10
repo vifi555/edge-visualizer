@@ -109,11 +109,61 @@ impl Analyzer {
         }
     }
 
+    /// Energy in a frequency range of the latest frame (raw, not smoothed).
+    pub fn band_energy(&self, lo_hz: f32, hi_hz: f32) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        let bin_hz = self.sample_rate as f32 / FFT_SIZE as f32;
+        let lo = ((lo_hz / bin_hz) as usize).max(1);
+        let hi = ((hi_hz / bin_hz) as usize).clamp(lo + 1, FFT_SIZE / 2);
+        let n = FFT_SIZE as f32;
+        self.buf[lo..hi].iter().map(|c| c.norm_sqr() / (n * n)).sum()
+    }
+
     pub fn bass(&self) -> f32 {
         let k = ((self.cur.len() as f32 * 0.12).round() as usize).max(1).min(self.cur.len());
         if k == 0 {
             return 0.0;
         }
         self.cur[..k].iter().sum::<f32>() / k as f32
+    }
+}
+
+/// Finds kick drums: a sudden jump in bass energy compared to the last second.
+pub struct BeatDetector {
+    avg: f32,
+    cooldown: f32,
+    /// 1.0 right after a beat, fading to 0.
+    pub level: f32,
+}
+
+impl BeatDetector {
+    pub fn new() -> Self {
+        Self {
+            avg: 0.0,
+            cooldown: 0.0,
+            level: 0.0,
+        }
+    }
+
+    /// Returns true on a new beat. `sensitivity` 0..1 (higher = more beats).
+    pub fn update(&mut self, energy: f32, dt: f32, sensitivity: f32) -> bool {
+        let k = 1.9 - 0.7 * sensitivity; // how far above average counts as a hit
+        self.cooldown -= dt;
+        let beat = self.cooldown <= 0.0 && energy > self.avg * k && energy > 1e-7;
+        // ~1 second running average of the bass energy
+        let a = 1.0 - (-dt / 1.0).exp();
+        self.avg += (energy - self.avg) * a;
+        if beat {
+            self.cooldown = 0.12;
+            self.level = 1.0;
+        } else {
+            self.level *= (-dt / 0.22).exp();
+            if self.level < 0.01 {
+                self.level = 0.0;
+            }
+        }
+        beat
     }
 }

@@ -25,7 +25,7 @@ use crate::lyrics::{Lyrics, LyricsState};
 use crate::media::{self, Track};
 use crate::settings::{self, Settings, Status};
 use crate::sys;
-use crate::viz::{Analyzer, FFT_SIZE};
+use crate::viz::{Analyzer, BeatDetector, FFT_SIZE};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 
@@ -821,6 +821,8 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
     register_hotkeys(hwnd);
     apply_window(hwnd, &s, sw, sh);
 
+    let rgb = crate::rgb::start();
+    let mut beat = BeatDetector::new();
     let mut an = Analyzer::new();
     let mut samples = vec![0.0f32; FFT_SIZE];
     let mut ts = TextState::new();
@@ -995,6 +997,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             artist: track.as_ref().map(|t| t.artist.clone()).unwrap_or_default(),
             lyrics: ly.status.clone(),
             audio_mode: audio.mode.lock().unwrap().clone(),
+            rgb: rgb.status.lock().unwrap().clone(),
         };
         if new_status != status {
             status = new_status;
@@ -1002,8 +1005,19 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         }
 
         if !s.visible {
-            std::thread::sleep(Duration::from_millis(50));
-            last = Instant::now();
+            // Visualizer hidden: keep the RGB sync running if it's on.
+            if s.rgb_enabled {
+                let dt = last.elapsed().as_secs_f32().min(0.1);
+                last = Instant::now();
+                let sr = audio.sample_rate.load(Ordering::Relaxed);
+                audio.ring.lock().unwrap().latest(&mut samples);
+                an.update(&samples, sr, &s, dt);
+                feed_rgb(&rgb, &mut beat, &an, &s, start.elapsed().as_secs_f32(), dt);
+                std::thread::sleep(Duration::from_millis(16));
+            } else {
+                std::thread::sleep(Duration::from_millis(50));
+                last = Instant::now();
+            }
             continue;
         }
 
@@ -1013,6 +1027,9 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         let sr = audio.sample_rate.load(Ordering::Relaxed);
         audio.ring.lock().unwrap().latest(&mut samples);
         an.update(&samples, sr, &s, dt);
+        if s.rgb_enabled {
+            feed_rgb(&rgb, &mut beat, &an, &s, start.elapsed().as_secs_f32(), dt);
+        }
 
         // ---- text
         let (main, sub, lyric) = pick_text(track.as_ref(), &ly, &s);
@@ -1091,6 +1108,23 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         crate::update::launch_updated(&tag);
     }
     Ok(())
+}
+
+/// Kick detection -> tells the RGB thread how bright to flash and in which colour.
+fn feed_rgb(rgb: &crate::rgb::Rgb, beat: &mut BeatDetector, an: &Analyzer, s: &Settings, t: f32, dt: f32) {
+    let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
+    let color = if s.rgb_follow {
+        let c = glow_color(&palette(s, false), t);
+        (c.r, c.g, c.b)
+    } else {
+        settings::parse_hex(&s.rgb_color).unwrap_or((1.0, 1.0, 1.0))
+    };
+    let mut p = rgb.pulse.lock().unwrap();
+    p.level = beat.level;
+    p.color = color;
+    if hit {
+        p.beat_at = Some(Instant::now());
+    }
 }
 
 /// Checks GitHub for a new version shortly after start, then every 6 hours.
