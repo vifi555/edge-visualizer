@@ -602,6 +602,8 @@ impl Gfx {
     }
 
     /// Hyperspace: stars streaking out from the centre of the screen.
+    /// Wormhole mode: the centre bends around (far things follow it, near things stay
+    /// in the middle, so streaks curve), the field rolls, and tunnel rings rush past.
     fn draw_hyperspace(&self, fx: &Fx, s: &Settings, t: f32) {
         if fx.stars.is_empty() || fx.hyper_vis <= 0.01 {
             return;
@@ -609,16 +611,55 @@ impl Gfx {
         let (cx, cy) = (self.w / 2.0, self.h / 2.0);
         let f = self.h / 2.0; // y = ±1 reaches the top/bottom edge
         let thick = (self.w.min(self.h) / 540.0).max(1.0);
+        // the tunnel's centre at depth z
+        let centre = |z: f32| (cx + fx.worm_off.0 * f * z, cy + fx.worm_off.1 * f * z);
+        let (rc, rs) = (fx.roll.cos(), fx.roll.sin());
         // longer streaks the faster we go
         let streak = 0.02 + fx.hyper_speed * 0.06;
         let pal = palette(s, false);
         unsafe {
             self.brush.SetOpacity(1.0);
+
+            // tunnel rings (far to near)
+            let mut order: Vec<(usize, f32)> = fx.rings.iter().copied().enumerate().collect();
+            order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (i, z) in order {
+                if !(0.04..=1.0).contains(&z) {
+                    continue;
+                }
+                let r = 0.38 / z * f;
+                if r > self.w.max(self.h) * 1.5 {
+                    continue;
+                }
+                let near = 1.0 - z;
+                let a = near * (z / 0.15).min(1.0) * 0.45 * fx.hyper_vis * s.opacity;
+                if a < 0.02 {
+                    continue;
+                }
+                let c = if s.hyper_follow {
+                    bar_color(&pal, t, (i as f32).cos(), (i as f32).sin())
+                } else {
+                    col(0.55, 0.6, 1.0, 1.0)
+                };
+                let wob = 0.12 * (fx.roll * 2.0).sin();
+                let (x, y) = centre(z);
+                self.brush.SetColor(&col(c.r, c.g, c.b, a));
+                let e = D2D1_ELLIPSE {
+                    point: pt(x, y),
+                    radiusX: r * (1.0 + wob),
+                    radiusY: r * (1.0 - wob),
+                };
+                self.dc
+                    .DrawEllipse(&e, &self.brush, thick * (1.0 + 4.0 * near), None::<&ID2D1StrokeStyle>);
+            }
+
             for st in &fx.stars {
                 let z1 = st.z.max(0.03);
                 let z0 = (st.pz.max(z1) + streak).min(1.0);
-                let (x1, y1) = (cx + st.x / z1 * f, cy + st.y / z1 * f);
-                let (x0, y0) = (cx + st.x / z0 * f, cy + st.y / z0 * f);
+                let (x, y) = (st.x * rc - st.y * rs, st.x * rs + st.y * rc); // roll
+                let (c1, c0) = (centre(z1), centre(z0));
+                let (x1, y1) = (c1.0 + x / z1 * f, c1.1 + y / z1 * f);
+                let (x0, y0) = (c0.0 + x / z0 * f, c0.1 + y / z0 * f);
                 let near = (1.0 - z1).clamp(0.0, 1.0);
                 let a = near.powf(1.5) * fx.hyper_vis * s.opacity;
                 if a < 0.02 {

@@ -443,6 +443,11 @@ impl eframe::App for App {
                     slider(ui, "Hyperspace (stars)", &mut s.hyperspace, 0.0..=1.0, off_pct);
                     if s.hyperspace > 0.0 {
                         slider(ui, "Warp speed", &mut s.hyper_speed, 0.0..=1.0, pct);
+                        combo(ui, "Hyperspace style", &mut s.hyper_style, &[("straight", "Straight (lightspeed)"), ("wormhole", "Wormhole")]);
+                        if s.hyper_style == "wormhole" {
+                            slider(ui, "Wormhole bend", &mut s.worm_bend, 0.0..=1.0, pct);
+                            toggle(ui, "Tunnel rings", &mut s.worm_rings);
+                        }
                         toggle(ui, "Stars match edge colors", &mut s.hyper_follow);
                     }
                     slider(ui, "Orbiting stars", &mut s.orbit_stars, 0..=8, |x| if x < 0.5 { "Off".into() } else { format!("{x:.0}") });

@@ -27,21 +27,24 @@ pub struct Settings {
     pub rgb_sensitivity: f32, // 0..1, higher = more beats
     pub rgb_corsair: bool,
     pub rgb_steelseries: bool,
-    pub bar_style: String,  // bars | rounded | dots | line
-    pub fx_peaks: bool,     // little caps that fall slowly
-    pub fx_glow: f32,       // 0..1 beat glow around the screen
-    pub fx_shake: f32,      // 0..1 bass shake
-    pub fx_glitch: f32,     // 0..1 RGB split on the beat
-    pub fx_particles: f32,  // 0..1 sparks from the bars
-    pub fx_trails: f32,     // 0..1 afterglow trails
-    pub circle_spin: f32,   // -1..1 rotation speed
-    pub circle_zoom: f32,   // 0..1 bass punch
-    pub hyperspace: f32,    // 0..1 star amount (0 = off)
-    pub hyper_speed: f32,   // 0..1 warp speed
-    pub hyper_follow: bool, // stars use the edge colours instead of white
-    pub orbit_stars: u32,   // 0..8 stars circling the middle (0 = off)
-    pub orbit_speed: f32,   // 0..1
-    pub orbit_follow: bool, // orbit stars use the circle colours instead of white
+    pub bar_style: String,   // bars | rounded | dots | line
+    pub fx_peaks: bool,      // little caps that fall slowly
+    pub fx_glow: f32,        // 0..1 beat glow around the screen
+    pub fx_shake: f32,       // 0..1 bass shake
+    pub fx_glitch: f32,      // 0..1 RGB split on the beat
+    pub fx_particles: f32,   // 0..1 sparks from the bars
+    pub fx_trails: f32,      // 0..1 afterglow trails
+    pub circle_spin: f32,    // -1..1 rotation speed
+    pub circle_zoom: f32,    // 0..1 bass punch
+    pub hyperspace: f32,     // 0..1 star amount (0 = off)
+    pub hyper_speed: f32,    // 0..1 warp speed
+    pub hyper_follow: bool,  // stars use the edge colours instead of white
+    pub hyper_style: String, // straight | wormhole
+    pub worm_bend: f32,      // 0..1 how far the wormhole bends
+    pub worm_rings: bool,    // glowing tunnel rings
+    pub orbit_stars: u32,    // 0..8 stars circling the middle (0 = off)
+    pub orbit_speed: f32,    // 0..1
+    pub orbit_follow: bool,  // orbit stars use the circle colours instead of white
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -95,6 +98,9 @@ impl Default for Settings {
             hyperspace: 0.0,
             hyper_speed: 0.5,
             hyper_follow: false,
+            hyper_style: "straight".into(),
+            worm_bend: 0.6,
+            worm_rings: true,
             orbit_stars: 0,
             orbit_speed: 0.5,
             orbit_follow: false,
@@ -210,6 +216,8 @@ impl Settings {
         self.hyperspace = self.hyperspace.clamp(0.0, 1.0);
         self.hyper_speed = self.hyper_speed.clamp(0.0, 1.0);
         self.orbit_stars = self.orbit_stars.min(8);
+        pick(&mut self.hyper_style, &["straight", "wormhole"], "straight");
+        self.worm_bend = self.worm_bend.clamp(0.0, 1.0);
         self.orbit_speed = self.orbit_speed.clamp(0.0, 1.0);
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");

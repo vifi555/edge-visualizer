@@ -52,6 +52,12 @@ pub struct Fx {
     pub orbit_angle: f32, // where the orbiting stars are
     pub orbit_kick: f32,  // 0..1, flare + speed burst right after a kick
     pub orbit_vis: f32,   // 0..1, fade with the music
+    // wormhole
+    pub worm_off: (f32, f32), // where the tunnel bends to (screen-height units)
+    worm_jolt: (f32, f32),    // a kick threw the tunnel this way
+    worm_t: f32,
+    pub roll: f32,       // starfield twist angle
+    pub rings: Vec<f32>, // tunnel ring depths
 }
 
 const MAX_PARTICLES: usize = 600;
@@ -77,6 +83,11 @@ impl Fx {
             orbit_angle: 0.0,
             orbit_kick: 0.0,
             orbit_vis: 0.0,
+            worm_off: (0.0, 0.0),
+            worm_jolt: (0.0, 0.0),
+            worm_t: 0.0,
+            roll: 0.0,
+            rings: Vec::new(),
         }
     }
 
@@ -224,11 +235,59 @@ impl Fx {
 
         // depth units per second
         self.hyper_speed = (0.12 + 0.9 * s.hyper_speed) * (0.35 + 1.4 * bass + 2.6 * self.warp) * self.hyper_vis;
+
+        let worm = s.hyper_style == "wormhole";
+        if worm {
+            // The tunnel wanders around on its own; some kicks throw it somewhere new.
+            self.worm_t += dt * (0.4 + self.warp);
+            if hit && self.rand() < 0.35 {
+                let a = self.rand() * TAU;
+                let r = 0.4 + 0.5 * self.rand();
+                self.worm_jolt = (a.cos() * r, a.sin() * r);
+            }
+            let fade = (-dt / 1.5).exp();
+            self.worm_jolt = (self.worm_jolt.0 * fade, self.worm_jolt.1 * fade);
+            let wt = self.worm_t;
+            let wander = (
+                (wt * 0.53).sin() * 0.7 + (wt * 0.21).cos() * 0.3,
+                (wt * 0.41).cos() * 0.6 + (wt * 0.17).sin() * 0.4,
+            );
+            let target = (
+                (wander.0 + self.worm_jolt.0) * s.worm_bend * aspect * 0.55,
+                (wander.1 + self.worm_jolt.1) * s.worm_bend * 0.55,
+            );
+            let k = 1.0 - (-dt / 0.5).exp();
+            self.worm_off.0 += (target.0 - self.worm_off.0) * k;
+            self.worm_off.1 += (target.1 - self.worm_off.1) * k;
+            // the whole field twists, faster in warp
+            self.roll = (self.roll + (0.1 + 0.8 * self.warp) * dt * self.hyper_vis).rem_euclid(TAU);
+            if s.worm_rings {
+                if self.rings.is_empty() {
+                    self.rings = (0..12).map(|i| (i as f32 + 0.5) / 12.0).collect();
+                }
+                for z in &mut self.rings {
+                    *z -= self.hyper_speed * dt;
+                    if *z < 0.04 {
+                        *z += 1.0;
+                    }
+                }
+            } else {
+                self.rings.clear();
+            }
+        } else {
+            let k = (-dt / 0.4).exp();
+            self.worm_off = (self.worm_off.0 * k, self.worm_off.1 * k);
+            self.roll *= k;
+            self.rings.clear();
+        }
+        // bent/twisted stars can come back on screen, so keep them a bit longer
+        let edge = if worm { 1.6 } else { 1.05 };
+
         for i in 0..self.stars.len() {
             let st = &mut self.stars[i];
             st.pz = st.z;
             st.z -= self.hyper_speed * dt;
-            let gone = st.z <= 0.03 || (st.x / st.z).abs() > aspect * 1.05 || (st.y / st.z).abs() > 1.05;
+            let gone = st.z <= 0.03 || (st.x / st.z).abs() > aspect * edge || (st.y / st.z).abs() > edge;
             if gone {
                 self.stars[i] = self.new_star(aspect, 1.0);
             }
