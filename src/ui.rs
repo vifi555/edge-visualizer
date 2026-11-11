@@ -503,9 +503,16 @@ impl eframe::App for App {
                         ui,
                         "Lyrics style",
                         &mut s.lyrics_style,
-                        &[("pop", "Pop in"), ("karaoke", "Karaoke (fills as it's sung)"), ("slide", "Slide in")],
+                        &[
+                            ("pop", "Pop in"),
+                            ("karaoke", "Karaoke (fills as it's sung)"),
+                            ("slide", "Slide in"),
+                            ("words", "Word by word (CapCut slam)"),
+                        ],
                     );
                     toggle(ui, "Bigger text on the chorus", &mut s.chorus_big);
+                    toggle(ui, "Editor look (thick outline + glow)", &mut s.text_outline);
+                    toggle(ui, "Lines shatter when they end", &mut s.lyrics_shatter);
                     toggle(ui, "Show BPM + beat counter (top right)", &mut s.show_bpm);
                     color_row(ui, "Text color", &mut s.text_color);
                     combo(
@@ -533,7 +540,10 @@ impl eframe::App for App {
                         }
                     });
                     ui.label(
-                        RichText::new("Lyrics come from lrclib.net. Lyrics late? Drag the timing slider right. Early? Drag it left.")
+                        RichText::new(
+                            "Lyrics come from lrclib.net. Lyrics late? Drag the timing slider right. Early? Drag it left. \
+                             Word by word guesses when each word is sung from the line's timing, so it can be slightly off.",
+                        )
                             .color(MUTED)
                             .size(12.0),
                     );
@@ -568,6 +578,10 @@ impl eframe::App for App {
                     slider(ui, "Bass ripple (shockwave rings)", &mut s.fx_ripple, 0.0..=1.0, off_pct);
                     if s.fx_ripple > 0.0 {
                         trig(ui, "t_ripple", &mut s.trig_ripple);
+                    }
+                    slider(ui, "Drop flash + zoom punch", &mut s.fx_drop, 0.0..=1.0, off_pct);
+                    if s.fx_drop > 0.0 {
+                        trig(ui, "t_drop", &mut s.trig_drop);
                     }
                     slider(ui, "Afterglow trails", &mut s.fx_trails, 0.0..=0.9, off_pct);
                     slider(ui, "Circle spin", &mut s.circle_spin, -1.0..=1.0, |x| {

@@ -32,7 +32,10 @@ pub fn builtin() -> Vec<Preset> {
         fx_ripple: 0.6,
         trig_ripple: "drop".into(),
         text_font: "impact".into(),
-        lyrics_style: "slide".into(),
+        lyrics_style: "words".into(),
+        text_outline: true,
+        lyrics_shatter: true,
+        fx_drop: 0.7,
         chorus_big: true,
         ..d.clone()
     };

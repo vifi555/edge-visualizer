@@ -66,6 +66,8 @@ pub struct Fx {
     pub glow: f32,         // 0..1, beat glow strength right now
     pub punch: f32,        // 0..1, circle bass zoom right now
     pub ripples: Vec<f32>, // ages (0..1) of shockwave rings
+    pub flash: f32,        // 0..1, drop flash right now
+    pub slam: f32,         // 0..1, drop zoom punch right now
     pub stars: Vec<Star>,
     pub warp: f32,      // 0..1, extra speed right after a kick
     pub hyper_vis: f32, // 0..1, stars fade in with music and out in silence
@@ -98,6 +100,8 @@ impl Fx {
             glow: 0.0,
             punch: 0.0,
             ripples: Vec::new(),
+            flash: 0.0,
+            slam: 0.0,
             stars: Vec::new(),
             warp: 0.0,
             hyper_vis: 0.0,
@@ -140,6 +144,20 @@ impl Fx {
         self.ripples.retain(|r| *r < 1.0);
         if s.fx_ripple <= 0.0 {
             self.ripples.clear();
+        }
+
+        // drop flash + zoom punch: a quick white flash and the whole picture punching in
+        if s.fx_drop > 0.0 && hits.on(&s.trig_drop) {
+            self.flash = 1.0;
+            self.slam = 1.0;
+        }
+        self.flash *= (-dt / 0.09).exp();
+        self.slam *= (-dt / 0.2).exp();
+        if self.flash < 0.005 {
+            self.flash = 0.0;
+        }
+        if self.slam < 0.005 {
+            self.slam = 0.0;
         }
 
         {
@@ -362,5 +380,7 @@ impl Fx {
             || (self.hyper_vis > 0.01 && !self.stars.is_empty())
             || self.orbit_vis > 0.01
             || !self.ripples.is_empty()
+            || self.flash > 0.0
+            || self.slam > 0.0
     }
 }

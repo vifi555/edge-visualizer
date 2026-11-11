@@ -104,6 +104,30 @@ fn scale_around(s: f32, cx: f32, cy: f32) -> Matrix3x2 {
         M32: cy - s * cy,
     }
 }
+/// Rotate (radians) and scale around a point.
+fn rot_scale_around(angle: f32, sc: f32, cx: f32, cy: f32) -> Matrix3x2 {
+    let (sn, cs) = angle.sin_cos();
+    let (m11, m12, m21, m22) = (sc * cs, sc * sn, -sc * sn, sc * cs);
+    Matrix3x2 {
+        M11: m11,
+        M12: m12,
+        M21: m21,
+        M22: m22,
+        M31: cx - (cx * m11 + cy * m21),
+        M32: cy - (cx * m12 + cy * m22),
+    }
+}
+/// a then b
+fn mul(a: &Matrix3x2, b: &Matrix3x2) -> Matrix3x2 {
+    Matrix3x2 {
+        M11: a.M11 * b.M11 + a.M12 * b.M21,
+        M12: a.M11 * b.M12 + a.M12 * b.M22,
+        M21: a.M21 * b.M11 + a.M22 * b.M21,
+        M22: a.M21 * b.M12 + a.M22 * b.M22,
+        M31: a.M31 * b.M11 + a.M32 * b.M21 + b.M31,
+        M32: a.M31 * b.M12 + a.M32 * b.M22 + b.M32,
+    }
+}
 fn identity() -> Matrix3x2 {
     scale_around(1.0, 0.0, 0.0)
 }
@@ -490,6 +514,27 @@ impl Gfx {
             let mut m = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut m)?;
             Ok((layout, m.width, m.height, m.left))
+        }
+    }
+
+    /// One line, no wrapping, starting at x = 0 (for single words / letters).
+    fn plain_layout(&self, text: &str, family: &str, weight: DWRITE_FONT_WEIGHT, size: f32) -> Result<(IDWriteTextLayout, f32, f32)> {
+        unsafe {
+            let fmt = self.dwrite.CreateTextFormat(
+                &HSTRING::from(family),
+                None::<&IDWriteFontCollection>,
+                weight,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                w!("en-us"),
+            )?;
+            fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let layout = self.dwrite.CreateTextLayout(&wide, &fmt, 100_000.0, 100_000.0)?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m)?;
+            Ok((layout, m.widthIncludingTrailingWhitespace, m.height))
         }
     }
 
@@ -1018,6 +1063,40 @@ struct TextState {
     vis: f32,
     main_lay: Option<(String, IDWriteTextLayout, f32, f32, f32)>, // key, layout, height, left, width
     sub_lay: Option<(String, IDWriteTextLayout, f32)>,
+    line_s: f32,                           // how long the current lyric line lasts (seconds)
+    lay_text: String,                      // the text main_lay was made from
+    last_at: (f32, f32),                   // where the main text was drawn last frame
+    words: Option<(String, Vec<WordBox>)>, // word-by-word style: one layout per word
+    shatter: bool,                         // break the previous line apart this frame
+    shards: Vec<Shard>,                    // flying letters
+    rng: u32,
+}
+
+/// One word of the line, for the word-by-word style.
+struct WordBox {
+    lay: IDWriteTextLayout,
+    x: f32, // offset inside the whole line's layout
+    y: f32,
+    w: f32,
+    h: f32,
+    frac: f32, // when in the line it gets sung (0..1)
+    tilt: f32, // random slam angle
+}
+
+/// A letter flying away after its line ended.
+struct Shard {
+    lay: IDWriteTextLayout,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    vx: f32,
+    vy: f32,
+    rot: f32,
+    vr: f32,
+    age: f32,
+    color: (f32, f32, f32),
+    a0: f32,
 }
 
 impl TextState {
@@ -1034,7 +1113,21 @@ impl TextState {
             vis: 0.0,
             main_lay: None,
             sub_lay: None,
+            line_s: 3.0,
+            lay_text: String::new(),
+            last_at: (0.0, 0.0),
+            words: None,
+            shatter: false,
+            shards: Vec::new(),
+            rng: 0x2545_F491,
         }
+    }
+
+    fn rand(&mut self) -> f32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        (self.rng >> 8) as f32 / 16_777_216.0
     }
 }
 
@@ -1045,6 +1138,7 @@ struct Pick {
     lyric: bool,
     progress: f32, // through the current line
     chorus: bool,  // this line repeats a lot in the song
+    line_s: f32,   // how long the line lasts
 }
 
 /// The line being sung right now, or the song name.
@@ -1055,6 +1149,7 @@ fn pick_text(track: Option<&Track>, ly: &LyricsState, s: &Settings) -> Pick {
         lyric: false,
         progress: 1.0,
         chorus: false,
+        line_s: 0.0,
     };
     let Some(tr) = track else {
         return plain(String::new(), String::new());
@@ -1082,6 +1177,7 @@ fn pick_text(track: Option<&Track>, ly: &LyricsState, s: &Settings) -> Pick {
             lyric: true,
             progress: 0.0,
             chorus: false,
+            line_s: 0.0,
         }; // nobody singing
     }
     let next = lines.get(i + 1);
@@ -1094,6 +1190,7 @@ fn pick_text(track: Option<&Track>, ly: &LyricsState, s: &Settings) -> Pick {
         lyric: true,
         progress,
         chorus,
+        line_s: ((end - line.t) / 1000.0) as f32,
     }
 }
 
@@ -1106,9 +1203,198 @@ fn font(s: &Settings) -> (&'static str, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT) 
     }
 }
 
+/// The "editor" look behind a piece of text: a coloured halo, a drop shadow and a
+/// thick dark outline (or just a soft shadow when that's off).
+unsafe fn text_backing(g: &Gfx, l: &IDWriteTextLayout, at: D2D_POINT_2F, a: f32, size: f32, dpi: f32, outline: bool, halo: D2D1_COLOR_F) {
+    let opts = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+    if !outline {
+        g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.6));
+        g.dc.DrawTextLayout(pt(at.x + 2.0 * dpi, at.y + 2.0 * dpi), l, &g.brush, opts);
+        return;
+    }
+    let dirs: [(f32, f32); 8] = [
+        (1.0, 0.0),
+        (0.707, 0.707),
+        (0.0, 1.0),
+        (-0.707, 0.707),
+        (-1.0, 0.0),
+        (-0.707, -0.707),
+        (0.0, -1.0),
+        (0.707, -0.707),
+    ];
+    let r = size * 0.09;
+    g.brush.SetColor(&col(halo.r, halo.g, halo.b, a * 0.16));
+    for (dx, dy) in dirs {
+        g.dc.DrawTextLayout(pt(at.x + dx * r, at.y + dy * r), l, &g.brush, opts);
+    }
+    let sh = size * 0.07;
+    g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.7));
+    g.dc.DrawTextLayout(pt(at.x + sh * 0.4, at.y + sh), l, &g.brush, opts);
+    let o = (size * 0.045).max(1.5);
+    g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.95));
+    for (dx, dy) in dirs {
+        g.dc.DrawTextLayout(pt(at.x + dx * o, at.y + dy * o), l, &g.brush, opts);
+    }
+}
+
+/// The highlight colour for the word being sung: the edge colour, or yellow when that's white.
+fn accent(s: &Settings, t: f32) -> D2D1_COLOR_F {
+    let c = glow_color(&palette(s, false), t);
+    if c.r.min(c.g).min(c.b) > 0.75 {
+        col(1.0, 0.84, 0.1, 1.0)
+    } else {
+        col(c.r, c.g, c.b, 1.0)
+    }
+}
+
+/// Splits the line into words and lays each one out where it sits in the full line.
+fn build_words(
+    g: &Gfx,
+    ts: &mut TextState,
+    line: &IDWriteTextLayout,
+    family: &str,
+    weight: DWRITE_FONT_WEIGHT,
+    size: f32,
+) -> Result<Vec<WordBox>> {
+    let text = ts.shown_main.clone();
+    // (utf16 start, word)
+    let mut words: Vec<(u32, String)> = Vec::new();
+    let mut pos16 = 0u32;
+    let mut cur = String::new();
+    let mut start = 0u32;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !cur.is_empty() {
+                words.push((start, std::mem::take(&mut cur)));
+            }
+        } else {
+            if cur.is_empty() {
+                start = pos16;
+            }
+            cur.push(ch);
+        }
+        pos16 += ch.len_utf16() as u32;
+    }
+    if !cur.is_empty() {
+        words.push((start, cur));
+    }
+    let total: usize = words.iter().map(|w| w.1.chars().count()).sum::<usize>().max(1);
+    let mut before = 0usize;
+    let mut out = Vec::new();
+    for (start, word) in words.into_iter().take(40) {
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe { line.HitTestTextPosition(start, false, &mut x, &mut y, &mut m)? };
+        let (lay, w, h) = g.plain_layout(&word, family, weight, size)?;
+        // sung across the first ~85% of the line, longer words take longer
+        let frac = before as f32 / total as f32 * 0.85;
+        before += word.chars().count();
+        let tilt = (ts.rand() - 0.5) * 0.3;
+        out.push(WordBox {
+            lay,
+            x: m.left,
+            y: m.top,
+            w,
+            h,
+            frac,
+            tilt,
+        });
+    }
+    Ok(out)
+}
+
+/// Breaks the line that just ended into letters that fly off.
+fn spawn_shards(g: &Gfx, ts: &mut TextState, line: &IDWriteTextLayout, s: &Settings, dpi: f32) {
+    let (family, weight, _) = font(s);
+    let text = ts.lay_text.clone();
+    let size = unsafe { line.GetFontSize() };
+    let (tr, tg, tb) = settings::parse_hex(&s.text_color).unwrap_or((1.0, 1.0, 1.0));
+    let (ax, ay) = ts.last_at;
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe {
+        let _ = line.GetMetrics(&mut metrics);
+    }
+    let mid = ax + metrics.left + metrics.width / 2.0;
+    let half = (metrics.width / 2.0).max(1.0);
+    let mut pos16 = 0u32;
+    let mut n = 0;
+    for ch in text.chars() {
+        let here = pos16;
+        pos16 += ch.len_utf16() as u32;
+        if ch.is_whitespace() || n >= 80 {
+            continue;
+        }
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        if unsafe { line.HitTestTextPosition(here, false, &mut x, &mut y, &mut m) }.is_err() {
+            continue;
+        }
+        let Ok((lay, w, h)) = g.plain_layout(&ch.to_string(), family, weight, size) else {
+            continue;
+        };
+        let px = ax + m.left;
+        let side = ((px + w / 2.0 - mid) / half).clamp(-1.0, 1.0);
+        let (r1, r2, r3) = (ts.rand(), ts.rand(), ts.rand());
+        ts.shards.push(Shard {
+            lay,
+            x: px,
+            y: ay + m.top,
+            w,
+            h,
+            vx: (side * 320.0 + (r1 - 0.5) * 260.0) * dpi,
+            vy: -(180.0 + r2 * 380.0) * dpi,
+            rot: 0.0,
+            vr: (r3 - 0.5) * 12.0,
+            age: 0.0,
+            color: (tr, tg, tb),
+            a0: s.opacity,
+        });
+        n += 1;
+    }
+}
+
+fn draw_shards(g: &Gfx, ts: &mut TextState, s: &Settings, dt: f32, dpi: f32) {
+    if ts.shards.is_empty() {
+        return;
+    }
+    const LIFE: f32 = 0.95;
+    for sh in &mut ts.shards {
+        sh.age += dt;
+        sh.vy += 1100.0 * dpi * dt;
+        sh.x += sh.vx * dt;
+        sh.y += sh.vy * dt;
+        sh.rot += sh.vr * dt;
+    }
+    ts.shards.retain(|sh| sh.age < LIFE);
+    let size = s.text_size * dpi;
+    unsafe {
+        g.brush.SetOpacity(1.0);
+        for sh in &ts.shards {
+            let k = 1.0 - sh.age / LIFE;
+            let a = sh.a0 * k * k;
+            let sc = 0.6 + 0.4 * k;
+            g.dc.SetTransform(&rot_scale_around(sh.rot, sc, sh.x + sh.w / 2.0, sh.y + sh.h / 2.0));
+            let at = pt(sh.x, sh.y);
+            g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.7));
+            let o = if s.text_outline { size * 0.05 } else { 2.0 * dpi };
+            g.dc.DrawTextLayout(pt(at.x + o, at.y + o), &sh.lay, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            g.brush.SetColor(&col(sh.color.0, sh.color.1, sh.color.2, a));
+            g.dc.DrawTextLayout(at, &sh.lay, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        }
+        g.dc.SetTransform(&identity());
+    }
+}
+
 /// Lyrics / song name at the bottom. Styles: pop (rises in), karaoke (colour sweeps
-/// across as it's sung), slide (glides in from the side). Chorus lines can be bigger.
-fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> Result<()> {
+/// across as it's sung), slide (glides in from the side), words (each word slams in
+/// as it's sung, CapCut style). Chorus lines can be bigger.
+fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32, t: f32) -> Result<()> {
+    // the line that just ended breaks apart (before its layout gets replaced)
+    if std::mem::take(&mut ts.shatter) {
+        if let Some(l) = ts.main_lay.as_ref().map(|x| x.1.clone()) {
+            spawn_shards(g, ts, &l, s, dpi);
+        }
+    }
     if ts.vis <= 0.01 || ts.shown_main.is_empty() {
         return Ok(());
     }
@@ -1126,7 +1412,14 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
     let key_main = format!("{}|{}|{}|{}", ts.shown_main, family, size, max_w);
     if ts.main_lay.as_ref().map(|x| &x.0) != Some(&key_main) {
         let (l, w, h, left) = g.text_layout(&ts.shown_main, family, w_main, size, max_w)?;
-        ts.main_lay = Some((key_main, l, h, left, w));
+        ts.main_lay = Some((key_main.clone(), l, h, left, w));
+        ts.lay_text = ts.shown_main.clone();
+    }
+    let words_mode = s.lyrics_style == "words";
+    if words_mode && ts.words.as_ref().map(|x| &x.0) != Some(&key_main) {
+        let line = ts.main_lay.as_ref().map(|x| x.1.clone()).unwrap();
+        let list = build_words(g, ts, &line, family, w_main, size)?;
+        ts.words = Some((key_main.clone(), list));
     }
     let key_sub = format!("{}|{}|{}|{}", sub_text, family, sub_size, max_w);
     if sub_text.is_empty() {
@@ -1139,7 +1432,11 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
     let edge = if bottom_bars(s) { g.w.min(g.h) * 0.11 * s.size } else { 0.0 };
     let (tr, tg, tb) = settings::parse_hex(&s.text_color).unwrap_or((1.0, 1.0, 1.0));
     let bottom = (edge + (30.0 + s.text_offset) * dpi).max(0.0);
-    let pop = (ts.changed.elapsed().as_secs_f32() / 0.28).min(1.0);
+    let pop = if words_mode {
+        1.0
+    } else {
+        (ts.changed.elapsed().as_secs_f32() / 0.28).min(1.0)
+    };
     let ease = 1.0 - (1.0 - pop) * (1.0 - pop);
     let (x_off, y_off) = match s.lyrics_style.as_str() {
         "slide" => (-80.0 * dpi * (1.0 - ease), 0.0),
@@ -1152,47 +1449,84 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
     let alpha = ts.vis * s.opacity;
     let pulse = 1.0 + 0.15 * s.text_pulse * bass;
     let karaoke = s.lyrics_style == "karaoke" && ts.shown_lyric;
+    let halo = glow_color(&palette(s, false), t);
+    let opts = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+    let base = scale_around(pulse, g.w / 2.0, g.h - bottom);
 
     unsafe {
-        g.dc.SetTransform(&scale_around(pulse, g.w / 2.0, g.h - bottom));
+        g.dc.SetTransform(&base);
         g.brush.SetOpacity(1.0);
         if let Some((_, l, h, left, w)) = &ts.main_lay {
             let a = alpha * pop;
             let at = pt(x0, top + y_off);
-            g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.6));
-            g.dc.DrawTextLayout(
-                pt(at.x + 2.0 * dpi, at.y + 2.0 * dpi),
-                l,
-                &g.brush,
-                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-            );
-            if karaoke {
-                // dim line, then the sung part in full colour, sweeping left to right
-                g.brush.SetColor(&col(tr, tg, tb, a * 0.35));
-                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                let sweep = at.x + left + w * ts.progress;
-                g.dc.PushAxisAlignedClip(&rect(at.x - 4.0, at.y - 4.0, sweep, at.y + h + 8.0), D2D1_ANTIALIAS_MODE_ALIASED);
-                g.brush.SetColor(&col(tr, tg, tb, a));
-                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                g.dc.PopAxisAlignedClip();
+            ts.last_at = (at.x, at.y);
+            if words_mode {
+                if let Some((_, list)) = &ts.words {
+                    let since = ts.changed.elapsed().as_secs_f32();
+                    let ages: Vec<f32> = list
+                        .iter()
+                        .enumerate()
+                        .map(|(i, wb)| {
+                            if ts.shown_lyric {
+                                (ts.progress - wb.frac) * ts.line_s.max(0.3)
+                            } else {
+                                since - i as f32 * 0.09
+                            }
+                        })
+                        .collect();
+                    let active = if ts.shown_lyric && ts.progress < 0.999 {
+                        ages.iter().rposition(|&a| a >= 0.0)
+                    } else {
+                        None
+                    };
+                    let hi = accent(s, t);
+                    for (i, wb) in list.iter().enumerate() {
+                        let age = ages[i];
+                        if age < 0.0 {
+                            continue; // not sung yet
+                        }
+                        let k = (age / 0.05).min(1.0);
+                        let is_active = active == Some(i);
+                        let sc = (1.0 + 0.75 * (-11.0 * age).exp() * (17.0 * age).cos()) * if is_active { 1.07 } else { 1.0 };
+                        let rot = wb.tilt * (-7.0 * age).exp();
+                        let drop = -size * 0.35 * (-14.0 * age).exp();
+                        let wx = at.x + wb.x;
+                        let wy = at.y + wb.y;
+                        let mut m = rot_scale_around(rot, sc, wx + wb.w / 2.0, wy + wb.h / 2.0);
+                        m.M32 += drop;
+                        g.dc.SetTransform(&mul(&m, &base));
+                        let wa = a * k;
+                        text_backing(g, &wb.lay, pt(wx, wy), wa, size, dpi, s.text_outline, halo);
+                        let c = if is_active { hi } else { col(tr, tg, tb, 1.0) };
+                        g.brush.SetColor(&col(c.r, c.g, c.b, wa));
+                        g.dc.DrawTextLayout(pt(wx, wy), &wb.lay, &g.brush, opts);
+                    }
+                    g.dc.SetTransform(&base);
+                }
             } else {
-                g.brush.SetColor(&col(tr, tg, tb, a));
-                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                text_backing(g, l, at, a, size, dpi, s.text_outline, halo);
+                if karaoke {
+                    // dim line, then the sung part in full colour, sweeping left to right
+                    g.brush.SetColor(&col(tr, tg, tb, a * 0.35));
+                    g.dc.DrawTextLayout(at, l, &g.brush, opts);
+                    let sweep = at.x + left + w * ts.progress;
+                    g.dc.PushAxisAlignedClip(&rect(at.x - 4.0, at.y - 4.0, sweep, at.y + h + 8.0), D2D1_ANTIALIAS_MODE_ALIASED);
+                    g.brush.SetColor(&col(tr, tg, tb, a));
+                    g.dc.DrawTextLayout(at, l, &g.brush, opts);
+                    g.dc.PopAxisAlignedClip();
+                } else {
+                    g.brush.SetColor(&col(tr, tg, tb, a));
+                    g.dc.DrawTextLayout(at, l, &g.brush, opts);
+                }
             }
         }
         if let Some((_, l, _)) = &ts.sub_lay {
             let y = top + main_h + sub_size * 0.3;
             let x = (g.w - max_w) / 2.0;
             let a = alpha * if ts.shown_lyric { 0.55 } else { 0.8 };
-            g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.6));
-            g.dc.DrawTextLayout(
-                pt(x + 1.5 * dpi, y + 1.5 * dpi),
-                l,
-                &g.brush,
-                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-            );
+            text_backing(g, l, pt(x, y), a, sub_size, dpi * 0.75, s.text_outline, halo);
             g.brush.SetColor(&col(tr, tg, tb, a));
-            g.dc.DrawTextLayout(pt(x, y), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            g.dc.DrawTextLayout(pt(x, y), l, &g.brush, opts);
         }
         g.dc.SetTransform(&identity());
     }
@@ -1400,7 +1734,9 @@ fn render(
         g.brush.SetOpacity(1.0);
         g.draw_particles(fx, s);
         g.brush.SetOpacity(s.opacity);
-        let text_res = draw_text(g, ts, s, an.bass(), dpi);
+        let text_res = draw_text(g, ts, s, an.bass(), dpi, t);
+        draw_shards(g, ts, s, dt, dpi);
+        g.brush.SetOpacity(s.opacity);
         let bpm_res = draw_bpm(g, bpm, s, dpi, t);
         g.dc.EndDraw(None, None)?;
         scene.Close()?;
@@ -1469,7 +1805,10 @@ fn render(
                 M31: 0.0,
                 M32: 0.0,
             };
-            g.dc.SetTransform(&fit);
+            // drop zoom punch: the whole picture jumps in a little, then settles
+            let z = 1.0 + 0.08 * s.fx_drop * fx.slam;
+            let view = mul(&scale_around(z, g.w / 2.0, g.h / 2.0), &fit);
+            g.dc.SetTransform(&view);
             let hyper_res = g.draw_hyperspace(fx, s, t);
             if s.glow > 0.5 {
                 if let Ok(out) = g.blur.GetOutput() {
@@ -1504,6 +1843,13 @@ fn render(
             } else {
                 Ok(())
             };
+            g.dc.SetTransform(&fit);
+            if fx.flash > 0.0 {
+                // drop flash
+                g.brush.SetOpacity(1.0);
+                g.brush.SetColor(&col(1.0, 1.0, 1.0, 0.38 * s.fx_drop * fx.flash));
+                g.dc.FillRectangle(&rect(0.0, 0.0, g.w, g.h), &g.brush);
+            }
             let toast_res = if sf.obs { Ok(()) } else { draw_toast(g, toast, dpi) };
             g.dc.SetTransform(&identity());
             g.dc.EndDraw(None, None)?;
@@ -1959,6 +2305,12 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 
         // ---- text
         if pick.main != ts.main || pick.lyric != ts.lyric {
+            if s.lyrics_shatter && ts.lyric && !ts.main.is_empty() && s.show_text {
+                ts.shatter = true;
+                if pick.main.is_empty() {
+                    ts.vis = 0.0; // the letters fly away instead of fading out
+                }
+            }
             if !pick.main.is_empty() {
                 ts.changed = Instant::now();
             }
@@ -1971,6 +2323,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             ts.shown_lyric = pick.lyric;
             ts.shown_chorus = pick.chorus;
             ts.progress = pick.progress;
+            ts.line_s = pick.line_s;
         }
         let target_vis = if s.show_text && !ts.main.is_empty() { 1.0 } else { 0.0 };
         let step = dt / 0.6;
@@ -2015,8 +2368,13 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         }
         // Sleep when silent: nothing on screen changes, so don't redraw it.
         let bars_max = an.cur.iter().fold(0.0f32, |a, &b| a.max(b));
-        let text_steady =
-            ts.vis == 0.0 || (ts.vis == 1.0 && ts.changed.elapsed() > Duration::from_millis(400) && s.lyrics_style != "karaoke");
+        let text_steady = (ts.vis == 0.0
+            || (ts.vis == 1.0
+                && ts.changed.elapsed() > Duration::from_millis(400)
+                && s.lyrics_style != "karaoke"
+                && s.lyrics_style != "words"))
+            && ts.shards.is_empty()
+            && !ts.shatter;
         let idle = bars_max < 0.003 && text_steady && toast.until <= Instant::now() && !fx.active();
         let use_trails = s.fx_trails > 0.01 && !idle;
         if idle && idle_drawn {

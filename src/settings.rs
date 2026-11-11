@@ -56,10 +56,14 @@ pub struct Settings {
     pub trig_warp: String,
     pub trig_orbit: String,
     pub trig_rgb: String,
+    pub trig_drop: String,
+    pub fx_drop: f32,         // 0..1 white flash + zoom punch
+    pub text_outline: bool,   // thick outline, drop shadow and coloured glow on the text
+    pub lyrics_shatter: bool, // finished lyric lines break apart into flying letters
     pub fx_ripple: f32,       // 0..1 shockwave rings
     pub kaleido: u32,         // 0 off, or 3 / 4 / 6 mirrored circle copies
     pub album_art: bool,      // song cover inside the circle
-    pub lyrics_style: String, // pop | karaoke | slide
+    pub lyrics_style: String, // pop | karaoke | slide | words
     pub chorus_big: bool,     // bigger text on lines that repeat (the chorus)
     pub show_bpm: bool,       // tempo + beat counter, top right
     pub display: String,      // main | 2 | 3 | all
@@ -130,6 +134,10 @@ impl Default for Settings {
             trig_glow: "kick".into(),
             trig_particles: "kick".into(),
             trig_ripple: "drop".into(),
+            trig_drop: "drop".into(),
+            fx_drop: 0.0,
+            text_outline: false,
+            lyrics_shatter: false,
             trig_zoom: "kick".into(),
             trig_warp: "kick".into(),
             trig_orbit: "kick".into(),
@@ -273,11 +281,13 @@ impl Settings {
             pick(t, TRIGGERS, "kick");
         }
         pick(&mut self.trig_ripple, TRIGGERS, "drop");
+        pick(&mut self.trig_drop, TRIGGERS, "drop");
+        self.fx_drop = self.fx_drop.clamp(0.0, 1.0);
         self.fx_ripple = self.fx_ripple.clamp(0.0, 1.0);
         if !matches!(self.kaleido, 0 | 3 | 4 | 6) {
             self.kaleido = 0;
         }
-        pick(&mut self.lyrics_style, &["pop", "karaoke", "slide"], "pop");
+        pick(&mut self.lyrics_style, &["pop", "karaoke", "slide", "words"], "pop");
         pick(&mut self.display, &["main", "2", "3", "all"], "main");
         pick(&mut self.obs_bg, &["green", "black"], "green");
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
