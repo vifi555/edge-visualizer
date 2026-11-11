@@ -29,10 +29,20 @@ pub fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Album cover for a song: (song key, image bytes).
+pub type Art = Arc<Mutex<Option<(String, Arc<Vec<u8>>)>>>;
+
+pub struct Media {
+    pub track: Arc<Mutex<Option<Track>>>,
+    pub art: Art,
+}
+
 /// `target` = exe of the app to follow ("" = prefer Spotify, else whatever is playing).
-pub fn start(target: Arc<Mutex<String>>) -> Arc<Mutex<Option<Track>>> {
+pub fn start(target: Arc<Mutex<String>>) -> Media {
     let shared = Arc::new(Mutex::new(None));
+    let art: Art = Arc::new(Mutex::new(None));
     let s = shared.clone();
+    let art_out = art.clone();
     std::thread::spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -46,15 +56,50 @@ pub fn start(target: Arc<Mutex<String>>) -> Arc<Mutex<Option<Track>>> {
                     continue;
                 }
             };
+            let mut art_key = String::new();
+            let mut art_tries = 0;
             loop {
                 let want = target.lock().unwrap().clone();
                 let t = read(&mgr, &want).unwrap_or(None);
+                // Cover art: fetch when the song changes (Spotify sometimes adds it a moment later).
+                if let Some(tr) = &t {
+                    let key = tr.key();
+                    if key != art_key {
+                        art_key = key.clone();
+                        art_tries = 0;
+                        *art_out.lock().unwrap() = None;
+                    }
+                    let have = art_out.lock().unwrap().is_some();
+                    if !have && art_tries < 6 {
+                        art_tries += 1;
+                        if let Ok(bytes) = read_art(&mgr, &want) {
+                            *art_out.lock().unwrap() = Some((key, Arc::new(bytes)));
+                        }
+                    }
+                }
                 *s.lock().unwrap() = t;
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
     });
-    shared
+    Media { track: shared, art }
+}
+
+fn read_art(mgr: &GlobalSystemMediaTransportControlsSessionManager, target: &str) -> windows::core::Result<Vec<u8>> {
+    use windows::Storage::Streams::DataReader;
+    let fail = || windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+    let session = pick_session(mgr, target).ok_or_else(fail)?;
+    let props = session.TryGetMediaPropertiesAsync()?.get()?;
+    let stream = props.Thumbnail()?.OpenReadAsync()?.get()?;
+    let size = stream.Size()? as u32;
+    if size == 0 || size > 20_000_000 {
+        return Err(fail());
+    }
+    let reader = DataReader::CreateDataReader(&stream)?;
+    reader.LoadAsync(size)?.get()?;
+    let mut buf = vec![0u8; size as usize];
+    reader.ReadBytes(&mut buf)?;
+    Ok(buf)
 }
 
 fn pick_session(mgr: &GlobalSystemMediaTransportControlsSessionManager, target: &str) -> Option<GlobalSystemMediaTransportControlsSession> {

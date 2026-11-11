@@ -67,9 +67,12 @@ pub fn start(target: &str) -> Arc<Shared> {
         let mut isolate_broken = false; // process loopback failed once: don't retry it
         loop {
             let target = s.target.lock().unwrap().clone();
-            let result = if target.is_empty() {
+            let result = if target == MIC {
+                set_mode(&s, "mic");
+                capture_system(&s, None, true)
+            } else if target.is_empty() {
                 set_mode(&s, "all");
-                capture_system(&s, None)
+                capture_system(&s, None, false)
             } else if !isolate_broken {
                 match find_app_pid(&target) {
                     Some(pid) => match capture_process(&s, pid, &target) {
@@ -90,7 +93,7 @@ pub fn start(target: &str) -> Arc<Shared> {
                 }
             } else {
                 set_mode(&s, "follow");
-                capture_system(&s, Some(&target))
+                capture_system(&s, Some(&target), false)
             };
             if let Err(e) = result {
                 crate::sys::log(&format!("audio: {e}"));
@@ -172,9 +175,12 @@ fn default_device() -> windows::core::Result<(IMMDeviceEnumerator, IMMDevice)> {
     }
 }
 
-fn device_id(en: &IMMDeviceEnumerator) -> Option<String> {
+/// The "Listen to" value meaning the microphone instead of what's playing.
+pub const MIC: &str = "__mic__";
+
+fn device_id(en: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String> {
     unsafe {
-        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let dev = en.GetDefaultAudioEndpoint(flow, eConsole).ok()?;
         let id = dev.GetId().ok()?;
         let s = id.to_string().ok();
         CoTaskMemFree(Some(id.0 as *const _));
@@ -258,18 +264,27 @@ unsafe fn drain(cap: &IAudioCaptureClient, s: &Shared, channels: usize, bits: u1
     }
 }
 
-/// Speakers loopback. With `follow`, scales the sound by that app's share of the volume.
-fn capture_system(s: &Shared, follow: Option<&str>) -> windows::core::Result<()> {
+/// Speakers loopback (or the microphone with `mic`). With `follow`, scales the sound by that app's share of the volume.
+fn capture_system(s: &Shared, follow: Option<&str>, mic: bool) -> windows::core::Result<()> {
     unsafe {
-        let (en, device) = default_device()?;
-        let my_id = device_id(&en);
+        let flow = if mic { eCapture } else { eRender };
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = en.GetDefaultAudioEndpoint(flow, eConsole)?;
+        let my_id = device_id(&en, flow);
         let my_target = s.target.lock().unwrap().clone();
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let fmt = client.GetMixFormat()?;
         let channels = ((*fmt).nChannels as usize).max(1);
         let bits = (*fmt).wBitsPerSample;
         let sr = (*fmt).nSamplesPerSec;
-        let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2_000_000, 0, fmt, None);
+        let init = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            if mic { 0 } else { AUDCLNT_STREAMFLAGS_LOOPBACK },
+            2_000_000,
+            0,
+            fmt,
+            None,
+        );
         CoTaskMemFree(Some(fmt as *const _));
         init?;
         s.sample_rate.store(sr, Ordering::Relaxed);
@@ -289,7 +304,7 @@ fn capture_system(s: &Shared, follow: Option<&str>) -> windows::core::Result<()>
 
             if now.duration_since(last_check) > Duration::from_secs(2) {
                 last_check = now;
-                if device_id(&en) != my_id || *s.target.lock().unwrap() != my_target {
+                if device_id(&en, flow) != my_id || *s.target.lock().unwrap() != my_target {
                     let _ = client.Stop();
                     return Ok(()); // device switched or a different app was chosen
                 }

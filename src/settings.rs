@@ -46,6 +46,26 @@ pub struct Settings {
     pub orbit_stars: u32,    // 0..8 stars circling the middle (0 = off)
     pub orbit_speed: f32,    // 0..1
     pub orbit_follow: bool,  // orbit stars use the circle colours instead of white
+    // what part of the music each effect plays on: kick | drop | vocals | highs
+    pub trig_shake: String,
+    pub trig_glitch: String,
+    pub trig_glow: String,
+    pub trig_particles: String,
+    pub trig_ripple: String,
+    pub trig_zoom: String,
+    pub trig_warp: String,
+    pub trig_orbit: String,
+    pub trig_rgb: String,
+    pub fx_ripple: f32,       // 0..1 shockwave rings
+    pub kaleido: u32,         // 0 off, or 3 / 4 / 6 mirrored circle copies
+    pub album_art: bool,      // song cover inside the circle
+    pub lyrics_style: String, // pop | karaoke | slide
+    pub chorus_big: bool,     // bigger text on lines that repeat (the chorus)
+    pub show_bpm: bool,       // tempo + beat counter, top right
+    pub display: String,      // main | 2 | 3 | all
+    pub wallpaper: bool,      // draw behind the desktop icons instead of on top
+    pub obs_window: bool,     // extra window for OBS
+    pub obs_bg: String,       // green | black
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -105,6 +125,25 @@ impl Default for Settings {
             orbit_stars: 0,
             orbit_speed: 0.5,
             orbit_follow: false,
+            trig_shake: "kick".into(),
+            trig_glitch: "kick".into(),
+            trig_glow: "kick".into(),
+            trig_particles: "kick".into(),
+            trig_ripple: "drop".into(),
+            trig_zoom: "kick".into(),
+            trig_warp: "kick".into(),
+            trig_orbit: "kick".into(),
+            trig_rgb: "kick".into(),
+            fx_ripple: 0.0,
+            kaleido: 0,
+            album_art: true,
+            lyrics_style: "pop".into(),
+            chorus_big: false,
+            show_bpm: false,
+            display: "main".into(),
+            wallpaper: false,
+            obs_window: false,
+            obs_bg: "green".into(),
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -220,6 +259,27 @@ impl Settings {
         pick(&mut self.hyper_style, &["straight", "wormhole"], "straight");
         self.worm_bend = self.worm_bend.clamp(0.0, 1.0);
         self.orbit_speed = self.orbit_speed.clamp(0.0, 1.0);
+        const TRIGGERS: &[&str] = &["kick", "drop", "vocals", "highs"];
+        for t in [
+            &mut self.trig_shake,
+            &mut self.trig_glitch,
+            &mut self.trig_glow,
+            &mut self.trig_particles,
+            &mut self.trig_zoom,
+            &mut self.trig_warp,
+            &mut self.trig_orbit,
+            &mut self.trig_rgb,
+        ] {
+            pick(t, TRIGGERS, "kick");
+        }
+        pick(&mut self.trig_ripple, TRIGGERS, "drop");
+        self.fx_ripple = self.fx_ripple.clamp(0.0, 1.0);
+        if !matches!(self.kaleido, 0 | 3 | 4 | 6) {
+            self.kaleido = 0;
+        }
+        pick(&mut self.lyrics_style, &["pop", "karaoke", "slide"], "pop");
+        pick(&mut self.display, &["main", "2", "3", "all"], "main");
+        pick(&mut self.obs_bg, &["green", "black"], "green");
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);

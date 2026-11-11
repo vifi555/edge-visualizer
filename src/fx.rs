@@ -14,6 +14,26 @@ pub struct Tip {
     pub level: f32,
 }
 
+/// Which parts of the music hit this frame. Each effect picks one ("plays on").
+#[derive(Clone, Copy, Default)]
+pub struct Hits {
+    pub kick: bool,   // kick drum / bass hit
+    pub drop: bool,   // an extra heavy bass hit
+    pub vocals: bool, // singing (voice range, while a lyric line is sung)
+    pub highs: bool,  // hi-hats, snares, claps
+}
+
+impl Hits {
+    pub fn on(&self, trigger: &str) -> bool {
+        match trigger {
+            "drop" => self.drop,
+            "vocals" => self.vocals,
+            "highs" => self.highs,
+            _ => self.kick,
+        }
+    }
+}
+
 pub struct Particle {
     pub x: f32,
     pub y: f32,
@@ -42,9 +62,10 @@ pub struct Fx {
     shake_dir: (f32, f32),
     shake_amp: f32,
     shake_t: f32,
-    pub glitch: f32, // 0..1, RGB split strength right now
-    pub glow: f32,   // 0..1, beat glow strength right now
-    pub punch: f32,  // 0..1, circle bass zoom right now
+    pub glitch: f32,       // 0..1, RGB split strength right now
+    pub glow: f32,         // 0..1, beat glow strength right now
+    pub punch: f32,        // 0..1, circle bass zoom right now
+    pub ripples: Vec<f32>, // ages (0..1) of shockwave rings
     pub stars: Vec<Star>,
     pub warp: f32,      // 0..1, extra speed right after a kick
     pub hyper_vis: f32, // 0..1, stars fade in with music and out in silence
@@ -76,6 +97,7 @@ impl Fx {
             glitch: 0.0,
             glow: 0.0,
             punch: 0.0,
+            ripples: Vec::new(),
             stars: Vec::new(),
             warp: 0.0,
             hyper_vis: 0.0,
@@ -99,7 +121,7 @@ impl Fx {
         (self.rng >> 8) as f32 / 16_777_216.0
     }
 
-    pub fn update(&mut self, dt: f32, hit: bool, cur: &[f32], s: &Settings, dpi: f32) {
+    pub fn update(&mut self, dt: f32, hits: Hits, cur: &[f32], s: &Settings, dpi: f32) {
         // peak caps: jump up with the bar, then fall slowly
         if self.peaks.len() != cur.len() {
             self.peaks = cur.to_vec();
@@ -109,23 +131,34 @@ impl Fx {
         }
         self.spin = (self.spin + s.circle_spin * dt * 1.2).rem_euclid(TAU);
 
-        if hit {
-            if s.fx_shake > 0.0 {
+        if s.fx_ripple > 0.0 && hits.on(&s.trig_ripple) && self.ripples.len() < 6 {
+            self.ripples.push(0.0);
+        }
+        for r in &mut self.ripples {
+            *r += dt / 0.9;
+        }
+        self.ripples.retain(|r| *r < 1.0);
+        if s.fx_ripple <= 0.0 {
+            self.ripples.clear();
+        }
+
+        {
+            if s.fx_shake > 0.0 && hits.on(&s.trig_shake) {
                 let a = self.rand() * TAU;
                 self.shake_dir = (a.cos(), a.sin());
                 self.shake_amp = s.fx_shake * 18.0 * dpi;
                 self.shake_t = 0.0;
             }
-            if s.fx_glitch > 0.0 {
+            if s.fx_glitch > 0.0 && hits.on(&s.trig_glitch) {
                 self.glitch = s.fx_glitch;
             }
-            if s.fx_glow > 0.0 {
+            if s.fx_glow > 0.0 && hits.on(&s.trig_glow) {
                 self.glow = s.fx_glow;
             }
-            if s.circle_zoom > 0.0 {
+            if s.circle_zoom > 0.0 && hits.on(&s.trig_zoom) {
                 self.punch = s.circle_zoom;
             }
-            if s.fx_particles > 0.0 && !self.tips.is_empty() {
+            if s.fx_particles > 0.0 && !self.tips.is_empty() && hits.on(&s.trig_particles) {
                 let count = (s.fx_particles * 36.0).round() as usize;
                 for _ in 0..count {
                     if self.particles.len() >= MAX_PARTICLES {
@@ -207,7 +240,8 @@ impl Fx {
 
     /// Hyperspace: stars fly towards you; bass speeds them up and kicks punch into warp.
     /// `playing` = is there sound right now; `aspect` = screen width / height.
-    pub fn update_hyper(&mut self, dt: f32, hit: bool, bass: f32, playing: bool, aspect: f32, s: &Settings) {
+    pub fn update_hyper(&mut self, dt: f32, hits: Hits, bass: f32, playing: bool, aspect: f32, s: &Settings) {
+        let hit = hits.on(&s.trig_warp);
         let want = (s.hyperspace * 600.0).round() as usize;
         if want == 0 {
             self.stars.clear();
@@ -295,7 +329,8 @@ impl Fx {
     }
 
     /// Orbiting stars: circle around the middle, speed up and flare on every kick.
-    pub fn update_orbit(&mut self, dt: f32, hit: bool, playing: bool, s: &Settings) {
+    pub fn update_orbit(&mut self, dt: f32, hits: Hits, playing: bool, s: &Settings) {
+        let hit = hits.on(&s.trig_orbit);
         if s.orbit_stars == 0 {
             self.orbit_vis = 0.0;
             return;
@@ -326,5 +361,6 @@ impl Fx {
             || x.abs() + y.abs() > 0.3
             || (self.hyper_vis > 0.01 && !self.stars.is_empty())
             || self.orbit_vis > 0.01
+            || !self.ripples.is_empty()
     }
 }

@@ -17,6 +17,8 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -26,6 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::fx::{Fx, Tip};
 use crate::lyrics::{Lyrics, LyricsState};
 use crate::media::{self, Track};
+use crate::screens::{self, Win};
 use crate::settings::{self, Settings, Status};
 use crate::sys;
 use crate::viz::{Analyzer, BeatDetector, FFT_SIZE};
@@ -33,13 +36,15 @@ use crate::viz::{Analyzer, BeatDetector, FFT_SIZE};
 const WM_APP_TRAY: u32 = WM_APP + 1;
 
 // ---------------------------------------------------------------- window messages -> events
-enum Ev {
+pub(crate) enum Ev {
     TrayLeft,
     TrayRight,
     Hotkey(i32),
     Display,
     TaskbarCreated,
     Close,
+    ObsClosed,
+    Resized(isize),
 }
 
 thread_local! {
@@ -49,6 +54,11 @@ static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 
 fn push(e: Ev) {
     EVENTS.with(|v| v.borrow_mut().push(e));
+}
+
+/// For the window procedures in screens.rs (same thread).
+pub(crate) fn push_event(e: Ev) {
+    push(e);
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -198,11 +208,21 @@ fn screen() -> (i32, i32, f32) {
 }
 
 // ---------------------------------------------------------------- GPU drawing
-struct Gfx {
+/// One window we draw into (a monitor overlay, a wallpaper layer or the OBS window).
+struct Surface {
+    hwnd: HWND,
     swap: IDXGISwapChain1,
-    dc: ID2D1DeviceContext,
     target: Option<ID2D1Bitmap1>,
     _comp: (IDCompositionDevice, IDCompositionTarget, IDCompositionVisual),
+    w: f32,
+    h: f32,
+    obs: bool,
+}
+
+struct Gfx {
+    dxgi: IDXGIDevice,
+    dxgi_factory: IDXGIFactory2,
+    dc: ID2D1DeviceContext,
     brush: ID2D1SolidColorBrush,
     blur: ID2D1Effect,
     red: ID2D1Effect,  // RGB split: red channel only
@@ -213,8 +233,12 @@ struct Gfx {
     trail_idx: Cell<usize>,
     trail_fresh: Cell<bool>,
     dwrite: IDWriteFactory,
+    wic: Option<IWICImagingFactory>,
+    art: RefCell<Option<(String, ID2D1Bitmap1)>>,
+    // The canvas everything is laid out on (the first screen); each window gets it scaled to fit.
     w: f32,
     h: f32,
+    surfaces: Vec<Surface>,
 }
 
 /// Colour matrix (5 rows x 4) keeping one channel, for the RGB split glitch.
@@ -226,7 +250,7 @@ fn channel_matrix(channel: usize) -> Vec<u8> {
 }
 
 impl Gfx {
-    fn new(hwnd: HWND, w: u32, h: u32) -> Result<Self> {
+    fn new(wins: &[Win]) -> Result<Self> {
         unsafe {
             let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
             let mut d3d: Option<ID3D11Device> = None;
@@ -265,29 +289,7 @@ impl Gfx {
             let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dev = factory.CreateDevice(&dxgi)?;
             let dc = dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
-
             let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: w,
-                Height: h,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                Stereo: FALSE,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                Flags: 0,
-            };
-            let swap = dxgi_factory.CreateSwapChainForComposition(&dxgi, &desc, None::<&IDXGIOutput>)?;
-
-            let comp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
-            let ctarget = comp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = comp.CreateVisual()?;
-            visual.SetContent(&swap)?;
-            ctarget.SetRoot(&visual)?;
-            comp.Commit()?;
 
             let brush = dc.CreateSolidColorBrush(&col(1.0, 1.0, 1.0, 1.0), None)?;
             let blur = dc.CreateEffect(&CLSID_D2D1GaussianBlur)?;
@@ -323,12 +325,18 @@ impl Gfx {
                 None,
             )?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let wic: Option<IWICImagingFactory> = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
 
+            let canvas = wins
+                .iter()
+                .find(|w| !w.obs)
+                .or(wins.first())
+                .map(|w| (w.w, w.h))
+                .unwrap_or((1920, 1080));
             let mut g = Gfx {
-                swap,
+                dxgi,
+                dxgi_factory,
                 dc,
-                target: None,
-                _comp: (comp, ctarget, visual),
                 brush,
                 blur,
                 red,
@@ -339,17 +347,60 @@ impl Gfx {
                 trail_idx: Cell::new(0),
                 trail_fresh: Cell::new(true),
                 dwrite,
-                w: w as f32,
-                h: h as f32,
+                wic,
+                art: RefCell::new(None),
+                w: canvas.0 as f32,
+                h: canvas.1 as f32,
+                surfaces: Vec::new(),
             };
-            g.make_target()?;
+            for win in wins {
+                g.add_surface(win)?;
+            }
             Ok(g)
         }
     }
 
-    fn make_target(&mut self) -> Result<()> {
+    fn add_surface(&mut self, win: &Win) -> Result<()> {
         unsafe {
-            let surface: IDXGISurface = self.swap.GetBuffer(0)?;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: win.w,
+                Height: win.h,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: FALSE,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: 0,
+            };
+            let swap = self
+                .dxgi_factory
+                .CreateSwapChainForComposition(&self.dxgi, &desc, None::<&IDXGIOutput>)?;
+            let comp: IDCompositionDevice = DCompositionCreateDevice(&self.dxgi)?;
+            let ctarget = comp.CreateTargetForHwnd(win.hwnd, true)?;
+            let visual = comp.CreateVisual()?;
+            visual.SetContent(&swap)?;
+            ctarget.SetRoot(&visual)?;
+            comp.Commit()?;
+            let target = self.make_target(&swap)?;
+            self.surfaces.push(Surface {
+                hwnd: win.hwnd,
+                swap,
+                target: Some(target),
+                _comp: (comp, ctarget, visual),
+                w: win.w as f32,
+                h: win.h as f32,
+                obs: win.obs,
+            });
+            Ok(())
+        }
+    }
+
+    fn make_target(&self, swap: &IDXGISwapChain1) -> Result<ID2D1Bitmap1> {
+        unsafe {
+            let surface: IDXGISurface = swap.GetBuffer(0)?;
             let props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -360,23 +411,58 @@ impl Gfx {
                 bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 ..Default::default()
             };
-            self.target = Some(self.dc.CreateBitmapFromDxgiSurface(&surface, Some(&props))?);
-            Ok(())
+            self.dc.CreateBitmapFromDxgiSurface(&surface, Some(&props))
         }
     }
 
-    fn resize(&mut self, w: u32, h: u32) -> Result<()> {
+    /// The OBS window was resized.
+    fn resize_surface(&mut self, hwnd: HWND, w: u32, h: u32) -> Result<()> {
+        let Some(i) = self.surfaces.iter().position(|sf| sf.hwnd == hwnd) else {
+            return Ok(());
+        };
         unsafe {
-            self.target = None;
-            *self.trails.borrow_mut() = [None, None];
-            self.trail_fresh.set(true);
             self.dc.SetTarget(None::<&ID2D1Image>);
-            self.swap
+            self.surfaces[i].target = None;
+            self.surfaces[i]
+                .swap
                 .ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))?;
         }
-        self.w = w as f32;
-        self.h = h as f32;
-        self.make_target()
+        let t = self.make_target(&self.surfaces[i].swap)?;
+        let sf = &mut self.surfaces[i];
+        sf.target = Some(t);
+        sf.w = w as f32;
+        sf.h = h as f32;
+        Ok(())
+    }
+
+    /// Album cover (jpg/png bytes from Windows) -> GPU bitmap.
+    fn set_art(&self, key: &str, bytes: &[u8]) {
+        let decoded = (|| -> Result<ID2D1Bitmap1> {
+            unsafe {
+                let wic = self.wic.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+                let stream = wic.CreateStream()?;
+                stream.InitializeFromMemory(bytes)?;
+                let dec = wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?;
+                let frame = dec.GetFrame(0)?;
+                let conv = wic.CreateFormatConverter()?;
+                conv.Initialize(
+                    &frame,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapDitherTypeNone,
+                    None::<&IWICPalette>,
+                    0.0,
+                    WICBitmapPaletteTypeMedianCut,
+                )?;
+                self.dc.CreateBitmapFromWicBitmap(&conv, None)
+            }
+        })();
+        match decoded {
+            Ok(bmp) => *self.art.borrow_mut() = Some((key.to_string(), bmp)),
+            Err(e) => {
+                sys::log(&format!("album art: {e}"));
+                *self.art.borrow_mut() = None;
+            }
+        }
     }
 
     fn text_layout(
@@ -386,7 +472,7 @@ impl Gfx {
         weight: DWRITE_FONT_WEIGHT,
         size: f32,
         max_w: f32,
-    ) -> Result<(IDWriteTextLayout, f32, f32)> {
+    ) -> Result<(IDWriteTextLayout, f32, f32, f32)> {
         unsafe {
             let fmt = self.dwrite.CreateTextFormat(
                 &HSTRING::from(family),
@@ -403,7 +489,7 @@ impl Gfx {
             let layout = self.dwrite.CreateTextLayout(&wide, &fmt, max_w, 100_000.0)?;
             let mut m = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut m)?;
-            Ok((layout, m.width, m.height))
+            Ok((layout, m.width, m.height, m.left))
         }
     }
 
@@ -528,6 +614,9 @@ impl Gfx {
         let r = min * 0.17 * s.size * (1.0 + 0.06 * bass + 0.25 * punch);
         let max_len = min * 0.16 * s.size;
         let bw = (std::f32::consts::TAU * r / m as f32 * 0.6).max(1.5);
+        if s.album_art {
+            self.draw_art(cx, cy, (r - bw - min * 0.01).max(4.0), s.opacity);
+        }
         let line_w = (min / 360.0).max(1.5);
         let pal = palette(s, true);
         let mut first: Option<(f32, f32)> = None;
@@ -784,6 +873,65 @@ impl Gfx {
         }
     }
 
+    /// Song cover as a round picture in the middle of the circle.
+    fn draw_art(&self, cx: f32, cy: f32, radius: f32, opacity: f32) {
+        let art = self.art.borrow();
+        let Some((_, bmp)) = art.as_ref() else { return };
+        unsafe {
+            let size = bmp.GetSize();
+            if size.width < 1.0 || size.height < 1.0 {
+                return;
+            }
+            let Ok(brush) = self.dc.CreateBitmapBrush(bmp, None, None) else {
+                return;
+            };
+            // cover the circle (crop the longer side), centred
+            let sc = 2.0 * radius / size.width.min(size.height);
+            brush.SetTransform(&Matrix3x2 {
+                M11: sc,
+                M12: 0.0,
+                M21: 0.0,
+                M22: sc,
+                M31: cx - size.width * sc / 2.0,
+                M32: cy - size.height * sc / 2.0,
+            });
+            brush.SetOpacity(0.92 * opacity);
+            let e = D2D1_ELLIPSE {
+                point: pt(cx, cy),
+                radiusX: radius,
+                radiusY: radius,
+            };
+            self.dc.FillEllipse(&e, &brush);
+        }
+    }
+
+    /// Shockwave rings spreading from the middle on big hits.
+    fn draw_ripples(&self, fx: &Fx, s: &Settings, t: f32) {
+        if fx.ripples.is_empty() {
+            return;
+        }
+        let (cx, cy) = (self.w / 2.0, self.h / 2.0);
+        let reach = (self.w * self.w + self.h * self.h).sqrt() * 0.6;
+        let c = glow_color(&palette(s, true), t);
+        unsafe {
+            self.brush.SetOpacity(1.0);
+            for &age in &fx.ripples {
+                let ease = 1.0 - (1.0 - age) * (1.0 - age);
+                let r = 20.0 + ease * reach;
+                let a = (1.0 - age).powi(2) * s.fx_ripple * s.opacity;
+                self.brush.SetColor(&col(c.r, c.g, c.b, a));
+                let e = D2D1_ELLIPSE {
+                    point: pt(cx, cy),
+                    radiusX: r,
+                    radiusY: r,
+                };
+                let width = (1.0 - age) * self.w.min(self.h) / 70.0 + 1.0;
+                self.dc.DrawEllipse(&e, &self.brush, width, None::<&ID2D1StrokeStyle>);
+            }
+            self.brush.SetOpacity(s.opacity);
+        }
+    }
+
     /// Sparks flying out from the bars.
     fn draw_particles(&self, fx: &Fx, s: &Settings) {
         unsafe {
@@ -864,9 +1012,11 @@ struct TextState {
     shown_main: String,
     shown_sub: String,
     shown_lyric: bool,
+    shown_chorus: bool,
+    progress: f32, // 0..1 how far through the current lyric line (karaoke)
     changed: Instant,
     vis: f32,
-    main_lay: Option<(String, IDWriteTextLayout, f32)>,
+    main_lay: Option<(String, IDWriteTextLayout, f32, f32, f32)>, // key, layout, height, left, width
     sub_lay: Option<(String, IDWriteTextLayout, f32)>,
 }
 
@@ -878,6 +1028,8 @@ impl TextState {
             shown_main: String::new(),
             shown_sub: String::new(),
             shown_lyric: false,
+            shown_chorus: false,
+            progress: 0.0,
             changed: Instant::now(),
             vis: 0.0,
             main_lay: None,
@@ -886,33 +1038,63 @@ impl TextState {
     }
 }
 
-/// What to show: the line being sung right now, or the song name.
-fn pick_text(track: Option<&Track>, ly: &LyricsState, s: &Settings) -> (String, String, bool) {
+/// What the bottom text shows right now.
+struct Pick {
+    main: String,
+    sub: String,
+    lyric: bool,
+    progress: f32, // through the current line
+    chorus: bool,  // this line repeats a lot in the song
+}
+
+/// The line being sung right now, or the song name.
+fn pick_text(track: Option<&Track>, ly: &LyricsState, s: &Settings) -> Pick {
+    let plain = |main: String, sub: String| Pick {
+        main,
+        sub,
+        lyric: false,
+        progress: 1.0,
+        chorus: false,
+    };
     let Some(tr) = track else {
-        return (String::new(), String::new(), false);
+        return plain(String::new(), String::new());
     };
     match s.text_shows.as_str() {
-        "title" => return (tr.title.clone(), String::new(), false),
-        "both" => return (tr.title.clone(), tr.artist.clone(), false),
+        "title" => return plain(tr.title.clone(), String::new()),
+        "both" => return plain(tr.title.clone(), tr.artist.clone()),
         _ => {}
     }
     let Some(lines) = ly.lines.as_ref().filter(|l| !l.is_empty()) else {
-        return (tr.title.clone(), tr.artist.clone(), false);
+        return plain(tr.title.clone(), tr.artist.clone());
     };
     let mut pos = tr.pos_ms + if tr.playing { media::now_ms() - tr.upd_ms } else { 0.0 } + s.lyrics_offset as f64 * 1000.0;
     if tr.dur_ms > 0.0 {
         pos = pos.min(tr.dur_ms + 1000.0);
     }
-    let i = match lines.iter().rposition(|l| l.t <= pos) {
-        Some(i) => i,
-        None => return (tr.title.clone(), tr.artist.clone(), false), // before the singing starts
+    let Some(i) = lines.iter().rposition(|l| l.t <= pos) else {
+        return plain(tr.title.clone(), tr.artist.clone()); // before the singing starts
     };
     let line = &lines[i];
     if line.text.is_empty() || (i == lines.len() - 1 && pos - line.t > 10_000.0) {
-        return (String::new(), String::new(), true); // nobody singing right now
+        return Pick {
+            main: String::new(),
+            sub: String::new(),
+            lyric: true,
+            progress: 0.0,
+            chorus: false,
+        }; // nobody singing
     }
-    let next = lines.get(i + 1).map(|l| l.text.clone()).unwrap_or_default();
-    (line.text.clone(), next, true)
+    let next = lines.get(i + 1);
+    let end = next.map(|l| l.t).unwrap_or(line.t + 4000.0);
+    let progress = (((pos - line.t) / (end - line.t).max(300.0)) as f32).clamp(0.0, 1.0);
+    let chorus = lines.iter().filter(|l| l.text == line.text).count() >= 3;
+    Pick {
+        main: line.text.clone(),
+        sub: next.map(|l| l.text.clone()).unwrap_or_default(),
+        lyric: true,
+        progress,
+        chorus,
+    }
 }
 
 fn font(s: &Settings) -> (&'static str, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT) {
@@ -924,13 +1106,16 @@ fn font(s: &Settings) -> (&'static str, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT) 
     }
 }
 
+/// Lyrics / song name at the bottom. Styles: pop (rises in), karaoke (colour sweeps
+/// across as it's sung), slide (glides in from the side). Chorus lines can be bigger.
 fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> Result<()> {
     if ts.vis <= 0.01 || ts.shown_main.is_empty() {
         return Ok(());
     }
     let (family, w_main, w_sub) = font(s);
-    let size = s.text_size * dpi;
-    let sub_size = (size * 0.42).max(10.0 * dpi);
+    let chorus = s.chorus_big && ts.shown_lyric && ts.shown_chorus;
+    let size = s.text_size * dpi * if chorus { 1.25 } else { 1.0 };
+    let sub_size = (s.text_size * dpi * 0.42).max(10.0 * dpi);
     let max_w = g.w * 0.8;
     let sub_text = if ts.shown_lyric {
         ts.shown_sub.clone()
@@ -940,14 +1125,14 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
 
     let key_main = format!("{}|{}|{}|{}", ts.shown_main, family, size, max_w);
     if ts.main_lay.as_ref().map(|x| &x.0) != Some(&key_main) {
-        let (l, _, h) = g.text_layout(&ts.shown_main, family, w_main, size, max_w)?;
-        ts.main_lay = Some((key_main, l, h));
+        let (l, w, h, left) = g.text_layout(&ts.shown_main, family, w_main, size, max_w)?;
+        ts.main_lay = Some((key_main, l, h, left, w));
     }
     let key_sub = format!("{}|{}|{}|{}", sub_text, family, sub_size, max_w);
     if sub_text.is_empty() {
         ts.sub_lay = None;
     } else if ts.sub_lay.as_ref().map(|x| &x.0) != Some(&key_sub) {
-        let (l, _, h) = g.text_layout(&sub_text, family, w_sub, sub_size, max_w)?;
+        let (l, _, h, _) = g.text_layout(&sub_text, family, w_sub, sub_size, max_w)?;
         ts.sub_lay = Some((key_sub, l, h));
     }
 
@@ -955,43 +1140,161 @@ fn draw_text(g: &Gfx, ts: &mut TextState, s: &Settings, bass: f32, dpi: f32) -> 
     let (tr, tg, tb) = settings::parse_hex(&s.text_color).unwrap_or((1.0, 1.0, 1.0));
     let bottom = (edge + (30.0 + s.text_offset) * dpi).max(0.0);
     let pop = (ts.changed.elapsed().as_secs_f32() / 0.28).min(1.0);
-    let y_off = 14.0 * dpi * (1.0 - pop);
+    let ease = 1.0 - (1.0 - pop) * (1.0 - pop);
+    let (x_off, y_off) = match s.lyrics_style.as_str() {
+        "slide" => (-80.0 * dpi * (1.0 - ease), 0.0),
+        _ => (0.0, 14.0 * dpi * (1.0 - pop)),
+    };
     let main_h = ts.main_lay.as_ref().map(|x| x.2).unwrap_or(0.0);
     let sub_h = ts.sub_lay.as_ref().map(|x| x.2 + sub_size * 0.3).unwrap_or(0.0);
     let top = g.h - bottom - main_h - sub_h;
-    let x0 = (g.w - max_w) / 2.0;
+    let x0 = (g.w - max_w) / 2.0 + x_off;
     let alpha = ts.vis * s.opacity;
     let pulse = 1.0 + 0.15 * s.text_pulse * bass;
+    let karaoke = s.lyrics_style == "karaoke" && ts.shown_lyric;
 
     unsafe {
         g.dc.SetTransform(&scale_around(pulse, g.w / 2.0, g.h - bottom));
         g.brush.SetOpacity(1.0);
-        if let Some((_, l, _)) = &ts.main_lay {
+        if let Some((_, l, h, left, w)) = &ts.main_lay {
             let a = alpha * pop;
+            let at = pt(x0, top + y_off);
             g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.6));
             g.dc.DrawTextLayout(
-                pt(x0 + 2.0 * dpi, top + y_off + 2.0 * dpi),
+                pt(at.x + 2.0 * dpi, at.y + 2.0 * dpi),
                 l,
                 &g.brush,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
             );
-            g.brush.SetColor(&col(tr, tg, tb, a));
-            g.dc.DrawTextLayout(pt(x0, top + y_off), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            if karaoke {
+                // dim line, then the sung part in full colour, sweeping left to right
+                g.brush.SetColor(&col(tr, tg, tb, a * 0.35));
+                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                let sweep = at.x + left + w * ts.progress;
+                g.dc.PushAxisAlignedClip(&rect(at.x - 4.0, at.y - 4.0, sweep, at.y + h + 8.0), D2D1_ANTIALIAS_MODE_ALIASED);
+                g.brush.SetColor(&col(tr, tg, tb, a));
+                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                g.dc.PopAxisAlignedClip();
+            } else {
+                g.brush.SetColor(&col(tr, tg, tb, a));
+                g.dc.DrawTextLayout(at, l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            }
         }
         if let Some((_, l, _)) = &ts.sub_lay {
             let y = top + main_h + sub_size * 0.3;
+            let x = (g.w - max_w) / 2.0;
             let a = alpha * if ts.shown_lyric { 0.55 } else { 0.8 };
             g.brush.SetColor(&col(0.0, 0.0, 0.0, a * 0.6));
             g.dc.DrawTextLayout(
-                pt(x0 + 1.5 * dpi, y + 1.5 * dpi),
+                pt(x + 1.5 * dpi, y + 1.5 * dpi),
                 l,
                 &g.brush,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
             );
             g.brush.SetColor(&col(tr, tg, tb, a));
-            g.dc.DrawTextLayout(pt(x0, y), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            g.dc.DrawTextLayout(pt(x, y), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
         }
         g.dc.SetTransform(&identity());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- BPM + beat counter (top right)
+struct Bpm {
+    times: std::collections::VecDeque<Instant>,
+    count: u32,
+    bpm: f32,
+    lay: Option<(String, IDWriteTextLayout, f32, f32)>,
+}
+
+impl Bpm {
+    fn new() -> Self {
+        Self {
+            times: Default::default(),
+            count: 0,
+            bpm: 0.0,
+            lay: None,
+        }
+    }
+
+    /// Tempo from the gaps between recent kicks (median, folded into 70-180 BPM).
+    fn on_beat(&mut self) {
+        let now = Instant::now();
+        self.times.push_back(now);
+        while self.times.len() > 16 || self.times.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(8)) {
+            self.times.pop_front();
+        }
+        self.count = self.count.wrapping_add(1);
+        let mut gaps: Vec<f32> = self
+            .times
+            .iter()
+            .zip(self.times.iter().skip(1))
+            .map(|(a, b)| b.duration_since(*a).as_secs_f32())
+            .collect();
+        if gaps.len() < 3 {
+            return;
+        }
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med = gaps[gaps.len() / 2];
+        if med <= 0.0 {
+            return;
+        }
+        let mut b = 60.0 / med;
+        while b < 70.0 {
+            b *= 2.0;
+        }
+        while b > 180.0 {
+            b /= 2.0;
+        }
+        self.bpm = if self.bpm == 0.0 { b } else { self.bpm * 0.7 + b * 0.3 };
+    }
+}
+
+fn draw_bpm(g: &Gfx, bpm: &mut Bpm, s: &Settings, dpi: f32, t: f32) -> Result<()> {
+    let fresh = bpm.times.back().is_some_and(|b| b.elapsed() < Duration::from_secs(3));
+    if !s.show_bpm || bpm.bpm <= 0.0 || !fresh {
+        return Ok(());
+    }
+    let text = format!("{:.0} BPM", bpm.bpm);
+    if bpm.lay.as_ref().map(|x| &x.0) != Some(&text) {
+        let (l, w, h, _) = g.text_layout(&text, "Segoe UI", DWRITE_FONT_WEIGHT_BOLD, 18.0 * dpi, 400.0 * dpi)?;
+        bpm.lay = Some((text.clone(), l, w, h));
+    }
+    let Some((_, l, tw, th)) = &bpm.lay else { return Ok(()) };
+    let top_bars = s.mode != "circle" && matches!(s.edges.as_str(), "all" | "topbottom" | "sides");
+    let inset = if top_bars { g.w.min(g.h) * 0.11 * s.size } else { 0.0 } + 24.0 * dpi;
+    let dot = 5.0 * dpi;
+    let dots_w = 4.0 * dot * 2.6;
+    // the layout is centred in a 400px box: shift so the text's right side lands where we want
+    let right = g.w - inset - dots_w;
+    let x = right - 200.0 * dpi - tw / 2.0;
+    let y = inset;
+    let since = bpm.times.back().map(|b| b.elapsed().as_secs_f32()).unwrap_or(9.0);
+    let c = glow_color(&palette(s, true), t);
+    unsafe {
+        g.brush.SetOpacity(1.0);
+        g.brush.SetColor(&col(1.0, 1.0, 1.0, 0.85 * s.opacity));
+        g.dc.DrawTextLayout(pt(x, y), l, &g.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // 4 dots: the current beat of the bar lights up
+        let cur = (bpm.count + 3) % 4;
+        for k in 0..4u32 {
+            let on = k == cur;
+            let a = if on { 1.0 - (since / 0.5).min(0.6) } else { 0.25 };
+            g.brush.SetColor(&col(c.r, c.g, c.b, a * s.opacity));
+            let cx = right + dot * 1.8 + k as f32 * dot * 2.6;
+            let r = if on {
+                dot * (1.0 + 0.4 * (1.0 - (since / 0.25).min(1.0)))
+            } else {
+                dot * 0.8
+            };
+            let e = D2D1_ELLIPSE {
+                point: pt(cx, y + th / 2.0),
+                radiusX: r,
+                radiusY: r,
+            };
+            g.dc.FillEllipse(&e, &g.brush);
+        }
+        g.brush.SetOpacity(s.opacity);
     }
     Ok(())
 }
@@ -1010,7 +1313,7 @@ fn draw_toast(g: &Gfx, toast: &mut Toast, dpi: f32) -> Result<()> {
     }
     let a = (left / 0.35).min(1.0);
     if toast.lay.as_ref().map(|x| &x.0) != Some(&toast.text) {
-        let (l, w, h) = g.text_layout(&toast.text, "Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * dpi, g.w * 0.9)?;
+        let (l, w, h, _) = g.text_layout(&toast.text, "Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * dpi, g.w * 0.9)?;
         toast.lay = Some((toast.text.clone(), l, w, h));
     }
     let Some((_, l, tw, th)) = &toast.lay else { return Ok(()) };
@@ -1032,6 +1335,21 @@ fn draw_toast(g: &Gfx, toast: &mut Toast, dpi: f32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- one frame
+/// Rotate + scale + (optionally) mirror around the screen centre, then move by (ox, oy).
+fn kaleido_matrix(cx: f32, cy: f32, scale: f32, angle: f32, mirror: bool, ox: f32, oy: f32) -> Matrix3x2 {
+    let sx = if mirror { -scale } else { scale };
+    let (c, sn) = (angle.cos(), angle.sin());
+    let (m11, m12, m21, m22) = (sx * c, sx * sn, -scale * sn, scale * c);
+    Matrix3x2 {
+        M11: m11,
+        M12: m12,
+        M21: m21,
+        M22: m22,
+        M31: cx + ox - (cx * m11 + cy * m21),
+        M32: cy + oy - (cx * m12 + cy * m22),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     g: &Gfx,
@@ -1043,33 +1361,51 @@ fn render(
     ts: &mut TextState,
     toast: &mut Toast,
     fx: &mut Fx,
+    bpm: &mut Bpm,
     use_trails: bool,
 ) -> Result<()> {
     unsafe {
         let clear = col(0.0, 0.0, 0.0, 0.0);
-        // Pass 1: bars + particles + text into a command list (so we can blur it for the glow)
+        // Pass 1: everything that glows, into a command list (laid out on the canvas)
         let scene = g.dc.CreateCommandList()?;
         g.dc.SetTarget(&scene);
         g.dc.BeginDraw();
         g.dc.Clear(Some(&clear));
         g.brush.SetOpacity(s.opacity);
         fx.tips.clear();
+        g.draw_ripples(fx, s, t);
         g.draw_orbit(fx, s, t, an.bass());
         if !an.cur.is_empty() {
             if s.mode != "circle" {
                 g.draw_edge(&an.cur, s, t, &fx.peaks, &mut fx.tips);
             }
             if s.mode != "edge" {
-                g.draw_circle(&an.cur, an.bass(), s, t, &fx.peaks, (fx.spin, fx.punch), &mut fx.tips);
+                if s.kaleido >= 3 {
+                    // kaleidoscope: smaller mirrored copies around the middle, slowly turning
+                    let n = s.kaleido as usize;
+                    let (cx, cy) = (g.w / 2.0, g.h / 2.0);
+                    let d = g.w.min(g.h) * 0.24 * s.size;
+                    let mut scratch = Vec::new();
+                    for k in 0..n {
+                        let a = fx.spin * 0.5 + t * 0.15 + k as f32 * std::f32::consts::TAU / n as f32;
+                        g.dc.SetTransform(&kaleido_matrix(cx, cy, 0.5, a, k % 2 == 1, a.cos() * d, a.sin() * d));
+                        g.draw_circle(&an.cur, an.bass(), s, t, &fx.peaks, (fx.spin, fx.punch), &mut scratch);
+                    }
+                    g.dc.SetTransform(&identity());
+                } else {
+                    g.draw_circle(&an.cur, an.bass(), s, t, &fx.peaks, (fx.spin, fx.punch), &mut fx.tips);
+                }
             }
         }
         g.brush.SetOpacity(1.0);
         g.draw_particles(fx, s);
         g.brush.SetOpacity(s.opacity);
         let text_res = draw_text(g, ts, s, an.bass(), dpi);
+        let bpm_res = draw_bpm(g, bpm, s, dpi, t);
         g.dc.EndDraw(None, None)?;
         scene.Close()?;
         text_res?;
+        bpm_res?;
 
         // Afterglow trails: last frame (faded) + this frame, in a ping-pong bitmap.
         let content: ID2D1Image = if use_trails {
@@ -1101,14 +1437,6 @@ fn render(
             scene.cast()?
         };
 
-        // Pass 2: glow + glitch + scene (shaken) onto the screen, then the beat glow
-        let target = g.target.as_ref().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
-        g.dc.SetTarget(target);
-        g.dc.BeginDraw();
-        g.dc.Clear(Some(&clear));
-        let (sx, sy) = fx.shake();
-        let hyper_res = g.draw_hyperspace(fx, s, t);
-        let off = pt(sx, sy);
         if s.glow > 0.5 {
             let sigma = s.glow * 0.5 * dpi;
             g.blur.SetValue(
@@ -1117,50 +1445,80 @@ fn render(
                 &sigma.to_le_bytes(),
             )?;
             g.blur.SetInput(0, &scene, true);
-            if let Ok(out) = g.blur.GetOutput() {
-                g.dc.DrawImage(
-                    &out,
-                    Some(&off),
-                    None,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                );
-            }
         }
-        if fx.glitch > 0.01 {
-            let gx = fx.glitch * 14.0 * dpi;
-            for (e, dx) in [(&g.red, -gx), (&g.blue, gx)] {
-                e.SetInput(0, &content, true);
-                if let Ok(out) = e.GetOutput() {
-                    let o = pt(sx + dx, sy);
-                    g.dc.DrawImage(&out, Some(&o), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_PLUS);
+        let (sx, sy) = fx.shake();
+        let off = pt(sx, sy);
+        let bg = if s.obs_bg == "black" {
+            col(0.0, 0.0, 0.0, 1.0)
+        } else {
+            col(0.0, 1.0, 0.0, 1.0)
+        };
+
+        // Pass 2: onto every window (each screen / wallpaper / OBS), scaled to its size
+        let n = g.surfaces.len();
+        for (si, sf) in g.surfaces.iter().enumerate() {
+            let Some(target) = sf.target.as_ref() else { continue };
+            g.dc.SetTarget(target);
+            g.dc.BeginDraw();
+            g.dc.Clear(Some(if sf.obs { &bg } else { &clear }));
+            let fit = Matrix3x2 {
+                M11: sf.w / g.w,
+                M12: 0.0,
+                M21: 0.0,
+                M22: sf.h / g.h,
+                M31: 0.0,
+                M32: 0.0,
+            };
+            g.dc.SetTransform(&fit);
+            let hyper_res = g.draw_hyperspace(fx, s, t);
+            if s.glow > 0.5 {
+                if let Ok(out) = g.blur.GetOutput() {
+                    g.dc.DrawImage(
+                        &out,
+                        Some(&off),
+                        None,
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                    );
                 }
             }
+            if fx.glitch > 0.01 {
+                let gx = fx.glitch * 14.0 * dpi;
+                for (e, dx) in [(&g.red, -gx), (&g.blue, gx)] {
+                    e.SetInput(0, &content, true);
+                    if let Ok(out) = e.GetOutput() {
+                        let o = pt(sx + dx, sy);
+                        g.dc.DrawImage(&out, Some(&o), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_PLUS);
+                    }
+                }
+            }
+            g.dc.DrawImage(
+                &content,
+                Some(&off),
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+            let glow_res = if fx.glow > 0.01 {
+                g.draw_beat_glow(fx.glow, glow_color(&palette(s, false), t))
+            } else {
+                Ok(())
+            };
+            let toast_res = if sf.obs { Ok(()) } else { draw_toast(g, toast, dpi) };
+            g.dc.SetTransform(&identity());
+            g.dc.EndDraw(None, None)?;
+            glow_res?;
+            hyper_res?;
+            toast_res?;
+            // only the last window waits for the screen refresh, so several windows don't slow it down
+            sf.swap.Present(if si + 1 == n { 1 } else { 0 }, DXGI_PRESENT(0)).ok()?;
         }
-        g.dc.DrawImage(
-            &content,
-            Some(&off),
-            None,
-            D2D1_INTERPOLATION_MODE_LINEAR,
-            D2D1_COMPOSITE_MODE_SOURCE_OVER,
-        );
-        let glow_res = if fx.glow > 0.01 {
-            g.draw_beat_glow(fx.glow, glow_color(&palette(s, false), t))
-        } else {
-            Ok(())
-        };
-        let toast_res = draw_toast(g, toast, dpi);
-        g.dc.EndDraw(None, None)?;
-        glow_res?;
-        hyper_res?;
-        toast_res?;
-        g.swap.Present(1, DXGI_PRESENT(0)).ok()?;
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------- tray + hotkeys + window
-fn load_icon(size: i32) -> HICON {
+pub(crate) fn load_icon(size: i32) -> HICON {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         match LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR) {
@@ -1191,7 +1549,16 @@ fn add_tray(hwnd: HWND) {
     }
 }
 
-const HK: [(i32, u32); 7] = [(1, 0x56), (2, 0x53), (3, 0x4D), (4, 0x43), (5, 0x54), (6, 0x26), (7, 0x28)]; // V S M C T Up Down
+const HK: [(i32, u32); 8] = [
+    (1, 0x56),
+    (2, 0x53),
+    (3, 0x4D),
+    (4, 0x43),
+    (5, 0x54),
+    (6, 0x26),
+    (7, 0x28),
+    (8, 0x50),
+]; // V S M C T Up Down P
 
 fn register_hotkeys(hwnd: HWND) {
     unsafe {
@@ -1237,7 +1604,9 @@ fn tray_menu(hwnd: HWND, s: &Settings) -> u32 {
     }
 }
 
-fn create_window(w: i32, h: i32) -> Result<HWND> {
+/// A hidden window that owns the tray icon and hotkeys (it stays while the drawing
+/// windows get rebuilt). Settings' Quit button finds it by its class name.
+fn create_control_window() -> Result<HWND> {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         let wc = WNDCLASSW {
@@ -1248,31 +1617,21 @@ fn create_window(w: i32, h: i32) -> Result<HWND> {
         };
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
             sys::OVERLAY_CLASS,
-            w!("Edge Visualizer Overlay"),
+            w!("Edge Visualizer"),
             WS_POPUP,
             0,
             0,
-            w,
-            h,
+            0,
+            0,
             HWND::default(),
             HMENU::default(),
             hinst,
             None,
         )?;
-        // Layered + transparent = clicks go straight through to the apps underneath.
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
         TASKBAR_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         Ok(hwnd)
-    }
-}
-
-fn apply_window(hwnd: HWND, s: &Settings, w: i32, h: i32) {
-    unsafe {
-        let after = if s.on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
-        let show = if s.visible { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
-        let _ = SetWindowPos(hwnd, after, 0, 0, w, h, SWP_NOACTIVATE | show);
     }
 }
 
@@ -1281,10 +1640,16 @@ fn cycle(list: &[&str], cur: &str) -> String {
     list[(i + 1) % list.len()].to_string()
 }
 
+/// Settings that need the drawing windows rebuilt when they change.
+fn window_key(s: &Settings) -> (String, bool, bool) {
+    (s.display.clone(), s.wallpaper, s.obs_window)
+}
+
 // ---------------------------------------------------------------- main loop
 pub fn run(updated_to: Option<String>) -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // for decoding album covers
     }
     let mut s = Settings::load();
     let mut s_mtime = settings::mtime(&settings::settings_path());
@@ -1294,16 +1659,26 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
     let media = media::start(media_target.clone());
     let mut lyrics = Lyrics::new();
 
-    let (mut sw, mut sh, mut dpi) = screen();
-    let hwnd = create_window(sw, sh)?;
-    let mut gfx = Some(Gfx::new(hwnd, sw as u32, sh as u32)?);
-    add_tray(hwnd);
-    register_hotkeys(hwnd);
-    apply_window(hwnd, &s, sw, sh);
+    let control = create_control_window()?;
+    add_tray(control);
+    register_hotkeys(control);
+
+    let mut dpi = unsafe { GetDpiForSystem().max(96) as f32 / 96.0 };
+    let (mut wins, mut warn) = screens::build(&s)?;
+    let mut wkey = window_key(&s);
+    screens::apply(&wins, &s);
+    let mut gfx = Gfx::new(&wins).ok();
+    let mut art_key = String::new();
 
     let rgb = crate::rgb::start();
+    // one detector per part of the music: kicks (bass), singing (voice range), hi-hats/snares (highs)
     let mut beat = BeatDetector::new();
+    let mut vocal = BeatDetector::new();
+    let mut highs = BeatDetector::new();
+    let mut rgb_level = 0.0f32;
     let mut fx = Fx::new();
+    let mut bpm = Bpm::new();
+    let mut preset_idx = 0usize;
     let mut an = Analyzer::new();
     let mut samples = vec![0.0f32; FFT_SIZE];
     let mut ts = TextState::new();
@@ -1316,12 +1691,17 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         until: Instant::now() + Duration::from_millis(3000),
         lay: None,
     };
+    if let Some(w) = warn.take() {
+        toast.text = w;
+        toast.until = Instant::now() + Duration::from_millis(4000);
+    }
     let start = Instant::now();
     let mut last = Instant::now();
     let mut last_poll = Instant::now();
     let mut status = Status::default();
     let mut gfx_error_logged = false;
     let mut idle_drawn = false; // drew the empty "nothing playing" frame already
+    let mut rebuild = false;
 
     let mut restart: Option<String> = None;
     'main: loop {
@@ -1343,29 +1723,41 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             }
         }
 
-        // ---- tray / hotkeys
+        // ---- tray / hotkeys / windows
         let events: Vec<Ev> = EVENTS.with(|v| std::mem::take(&mut *v.borrow_mut()));
         let mut changed = false;
         for ev in events {
             match ev {
                 Ev::Close => break 'main,
                 Ev::TrayLeft => sys::open_settings(),
-                Ev::TaskbarCreated => add_tray(hwnd),
-                Ev::Display => {
-                    let (w, h, d) = screen();
-                    if (w, h) != (sw, sh) {
-                        sw = w;
-                        sh = h;
-                        if let Some(g) = gfx.as_mut() {
-                            if g.resize(sw as u32, sh as u32).is_err() {
-                                gfx = None;
-                            }
-                        }
-                        apply_window(hwnd, &s, sw, sh);
-                    }
-                    dpi = d;
+                Ev::TaskbarCreated => {
+                    add_tray(control);
+                    rebuild = true; // Explorer restarted: the wallpaper layer is new too
                 }
-                Ev::TrayRight => match tray_menu(hwnd, &s) {
+                Ev::Display => {
+                    dpi = unsafe { GetDpiForSystem().max(96) as f32 / 96.0 };
+                    rebuild = true;
+                }
+                Ev::ObsClosed => {
+                    s.obs_window = false;
+                    changed = true;
+                }
+                Ev::Resized(raw) => {
+                    if let Some(w) = wins.iter_mut().find(|w| w.hwnd.0 as isize == raw) {
+                        let (cw, ch) = screens::client_size(w.hwnd);
+                        if (cw, ch) != (w.w, w.h) {
+                            w.w = cw;
+                            w.h = ch;
+                            if let Some(g) = gfx.as_mut() {
+                                if g.resize_surface(w.hwnd, cw, ch).is_err() {
+                                    gfx = None;
+                                }
+                            }
+                            idle_drawn = false;
+                        }
+                    }
+                }
+                Ev::TrayRight => match tray_menu(control, &s) {
                     1 => sys::open_settings(),
                     2 => {
                         s.visible = !s.visible;
@@ -1434,6 +1826,15 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                             s.intensity = ((s.intensity + d).clamp(0.3, 3.0) * 100.0).round() / 100.0;
                             msg = format!("Intensity {}%", (s.intensity * 100.0).round());
                         }
+                        8 => {
+                            // next preset
+                            let all = crate::presets::all();
+                            if !all.is_empty() {
+                                preset_idx = (preset_idx + 1) % all.len();
+                                s = crate::presets::apply(&s, &all[preset_idx].settings);
+                                msg = format!("Preset: {}", all[preset_idx].name);
+                            }
+                        }
                         _ => {}
                     }
                     if id != 2 {
@@ -1442,6 +1843,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                     if !msg.is_empty() {
                         toast.text = msg;
                         toast.until = Instant::now() + Duration::from_millis(2200);
+                        toast.lay = None;
                     }
                 }
             }
@@ -1452,7 +1854,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             idle_drawn = false;
             let _ = s.save();
             s_mtime = settings::mtime(&settings::settings_path());
-            apply_window(hwnd, &s, sw, sh);
+            screens::apply(&wins, &s);
         }
 
         // ---- settings changed in the settings window? + status for it
@@ -1464,13 +1866,42 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 let fresh = Settings::load();
                 if fresh != s {
                     s = fresh;
-                    apply_window(hwnd, &s, sw, sh);
+                    screens::apply(&wins, &s);
                     idle_drawn = false;
                 }
             }
         }
 
-        let track = media.lock().unwrap().clone();
+        // ---- screen / wallpaper / OBS settings changed: rebuild the drawing windows
+        if rebuild || window_key(&s) != wkey {
+            rebuild = false;
+            wkey = window_key(&s);
+            gfx = None; // release the GPU surfaces before their windows go
+            screens::destroy(&wins);
+            match screens::build(&s) {
+                Ok((w, warn)) => {
+                    wins = w;
+                    if let Some(m) = warn {
+                        toast.text = m;
+                        toast.until = Instant::now() + Duration::from_millis(4000);
+                        toast.lay = None;
+                    }
+                }
+                Err(e) => {
+                    sys::log(&format!("couldn't make windows: {e}"));
+                    wins = Vec::new();
+                }
+            }
+            screens::apply(&wins, &s);
+            art_key.clear();
+            ts.main_lay = None;
+            ts.sub_lay = None;
+            toast.lay = None;
+            bpm.lay = None;
+            idle_drawn = false;
+        }
+
+        let track = media.track.lock().unwrap().clone();
         lyrics.update(track.as_ref());
         let ly = lyrics.snapshot();
         let new_status = Status {
@@ -1485,53 +1916,61 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             status.save();
         }
 
-        if !s.visible {
-            // Visualizer hidden: keep the RGB sync running if it's on.
-            if s.rgb_enabled {
-                let dt = last.elapsed().as_secs_f32().min(0.1);
-                last = Instant::now();
-                let sr = audio.sample_rate.load(Ordering::Relaxed);
-                audio.ring.lock().unwrap().latest(&mut samples);
-                an.update(&samples, sr, &s, dt);
-                let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
-                feed_rgb(&rgb, &beat, hit, &s, start.elapsed().as_secs_f32());
-                std::thread::sleep(Duration::from_millis(16));
-            } else {
-                std::thread::sleep(Duration::from_millis(50));
-                last = Instant::now();
-            }
-            continue;
-        }
-
-        // ---- audio -> bars
+        // ---- audio -> bars + what hit this frame
         let dt = last.elapsed().as_secs_f32().min(0.1);
         last = Instant::now();
         let sr = audio.sample_rate.load(Ordering::Relaxed);
         audio.ring.lock().unwrap().latest(&mut samples);
         an.update(&samples, sr, &s, dt);
-        // kick drums drive the RGB sync and the screen effects
-        let hit = beat.update(an.band_energy(40.0, 130.0), dt, s.rgb_sensitivity);
-        if s.rgb_enabled {
-            feed_rgb(&rgb, &beat, hit, &s, start.elapsed().as_secs_f32());
+        let sens = s.rgb_sensitivity;
+        let kick = beat.update(an.band_energy(40.0, 130.0), dt, sens);
+        let voice = vocal.update(an.band_energy(300.0, 3000.0), dt, sens * 0.8);
+        let hat = highs.update(an.band_energy(4000.0, 12000.0), dt, sens * 0.8);
+        let pick = pick_text(track.as_ref(), &ly, &s);
+        // "singing": a voice-range hit while a lyric line is being sung (or anytime if there are no lyrics)
+        let no_lyrics = ly.lines.as_ref().map_or(true, |l| l.is_empty());
+        let singing = (pick.lyric && !pick.main.is_empty()) || no_lyrics;
+        let hits = crate::fx::Hits {
+            kick,
+            drop: kick && an.bass() > 0.55,
+            vocals: voice && singing,
+            highs: hat,
+        };
+        if kick {
+            bpm.on_beat();
         }
-        fx.update(dt, hit, &an.cur, &s, dpi);
+        if s.rgb_enabled {
+            let hit = hits.on(&s.trig_rgb);
+            rgb_level = if hit { 1.0 } else { rgb_level * (-dt / 0.22).exp() };
+            feed_rgb(&rgb, rgb_level, hit, &s, start.elapsed().as_secs_f32());
+        }
+
+        if !s.visible {
+            // Hidden: only keep the RGB sync running.
+            std::thread::sleep(Duration::from_millis(if s.rgb_enabled { 16 } else { 50 }));
+            continue;
+        }
+
+        fx.update(dt, hits, &an.cur, &s, dpi);
         let playing = an.cur.iter().any(|&v| v > 0.01);
-        fx.update_hyper(dt, hit, an.bass(), playing, sw as f32 / sh.max(1) as f32, &s);
-        fx.update_orbit(dt, hit, playing, &s);
+        let aspect = gfx.as_ref().map(|g| g.w / g.h.max(1.0)).unwrap_or(16.0 / 9.0);
+        fx.update_hyper(dt, hits, an.bass(), playing, aspect, &s);
+        fx.update_orbit(dt, hits, playing, &s);
 
         // ---- text
-        let (main, sub, lyric) = pick_text(track.as_ref(), &ly, &s);
-        if main != ts.main || lyric != ts.lyric {
-            if !main.is_empty() {
+        if pick.main != ts.main || pick.lyric != ts.lyric {
+            if !pick.main.is_empty() {
                 ts.changed = Instant::now();
             }
-            ts.main = main.clone();
-            ts.lyric = lyric;
+            ts.main = pick.main.clone();
+            ts.lyric = pick.lyric;
         }
-        if !main.is_empty() {
-            ts.shown_main = main;
-            ts.shown_sub = sub;
-            ts.shown_lyric = lyric;
+        if !pick.main.is_empty() {
+            ts.shown_main = pick.main;
+            ts.shown_sub = pick.sub;
+            ts.shown_lyric = pick.lyric;
+            ts.shown_chorus = pick.chorus;
+            ts.progress = pick.progress;
         }
         let target_vis = if s.show_text && !ts.main.is_empty() { 1.0 } else { 0.0 };
         let step = dt / 0.6;
@@ -1543,8 +1982,11 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 
         // ---- draw
         if gfx.is_none() {
-            match Gfx::new(hwnd, sw as u32, sh as u32) {
-                Ok(g) => gfx = Some(g),
+            match Gfx::new(&wins) {
+                Ok(g) => {
+                    gfx = Some(g);
+                    art_key.clear();
+                }
                 Err(e) => {
                     if !gfx_error_logged {
                         sys::log(&format!("graphics init failed: {e}"));
@@ -1555,9 +1997,26 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 }
             }
         }
+        // new album cover?
+        if let Some(g) = gfx.as_ref() {
+            let art = media.art.lock().unwrap().clone();
+            match art {
+                Some((key, bytes)) if key != art_key => {
+                    g.set_art(&key, &bytes);
+                    art_key = key;
+                    idle_drawn = false;
+                }
+                None if !art_key.is_empty() => {
+                    *g.art.borrow_mut() = None;
+                    art_key.clear();
+                }
+                _ => {}
+            }
+        }
         // Sleep when silent: nothing on screen changes, so don't redraw it.
         let bars_max = an.cur.iter().fold(0.0f32, |a, &b| a.max(b));
-        let text_steady = ts.vis == 0.0 || (ts.vis == 1.0 && ts.changed.elapsed() > Duration::from_millis(400));
+        let text_steady =
+            ts.vis == 0.0 || (ts.vis == 1.0 && ts.changed.elapsed() > Duration::from_millis(400) && s.lyrics_style != "karaoke");
         let idle = bars_max < 0.003 && text_steady && toast.until <= Instant::now() && !fx.active();
         let use_trails = s.fx_trails > 0.01 && !idle;
         if idle && idle_drawn {
@@ -1577,6 +2036,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 &mut ts,
                 &mut toast,
                 &mut fx,
+                &mut bpm,
                 use_trails,
             ) {
                 sys::log(&format!("draw failed, restarting graphics: {e}"));
@@ -1584,6 +2044,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
                 ts.main_lay = None;
                 ts.sub_lay = None;
                 toast.lay = None;
+                bpm.lay = None;
             }
         }
         idle_drawn = idle;
@@ -1599,9 +2060,11 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         }
     }
 
+    drop(gfx);
+    screens::destroy(&wins);
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
-        let _ = DestroyWindow(hwnd);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(control));
+        let _ = DestroyWindow(control);
     }
     let _ = std::fs::remove_file(settings::status_path());
     if let Some(tag) = restart {
@@ -1611,7 +2074,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
 }
 
 /// Kick detection -> tells the RGB thread how bright to flash and in which colour.
-fn feed_rgb(rgb: &crate::rgb::Rgb, beat: &BeatDetector, hit: bool, s: &Settings, t: f32) {
+fn feed_rgb(rgb: &crate::rgb::Rgb, level: f32, hit: bool, s: &Settings, t: f32) {
     let color = if s.rgb_follow {
         let c = glow_color(&palette(s, false), t);
         (c.r, c.g, c.b)
@@ -1619,7 +2082,7 @@ fn feed_rgb(rgb: &crate::rgb::Rgb, beat: &BeatDetector, hit: bool, s: &Settings,
         settings::parse_hex(&s.rgb_color).unwrap_or((1.0, 1.0, 1.0))
     };
     let mut p = rgb.pulse.lock().unwrap();
-    p.level = beat.level;
+    p.level = level;
     p.color = color;
     if hit {
         p.beat_at = Some(Instant::now());

@@ -45,6 +45,9 @@ struct App {
     confirm_reset: bool,
     update_msg: std::sync::Arc<std::sync::Mutex<String>>,
     apps: Vec<String>,
+    user_presets: Vec<crate::presets::Preset>,
+    preset_name: String,
+    monitors: usize,
 }
 
 impl App {
@@ -63,6 +66,9 @@ impl App {
             confirm_reset: false,
             update_msg: Default::default(),
             apps: crate::audio::list_apps(),
+            user_presets: crate::presets::load_user(),
+            preset_name: String::new(),
+            monitors: crate::screens::monitors().len(),
         }
     }
 
@@ -234,8 +240,34 @@ fn theme_rows(ui: &mut egui::Ui, label: &str, theme: &mut String, a: &mut String
     }
 }
 
+const TRIGGERS: &[(&str, &str)] = &[
+    ("kick", "Kick / bass"),
+    ("drop", "Big drops"),
+    ("vocals", "Singing"),
+    ("highs", "Hi-hats & snares"),
+];
+
+/// "plays on" picker under an effect: which part of the music sets it off.
+fn trig(ui: &mut egui::Ui, id: &str, value: &mut String) {
+    row(ui, "      ↳ plays on", |ui| {
+        let cur = TRIGGERS
+            .iter()
+            .find(|o| o.0 == value.as_str())
+            .map(|o| o.1)
+            .unwrap_or("Kick / bass");
+        egui::ComboBox::new(id, "").selected_text(cur).width(180.0).show_ui(ui, |ui| {
+            for (key, text) in TRIGGERS {
+                ui.selectable_value(value, key.to_string(), *text);
+            }
+        });
+    });
+}
+
 /// "spotify.exe" -> "Spotify"
 fn pretty_app(exe: &str) -> String {
+    if exe == crate::audio::MIC {
+        return "Microphone".into();
+    }
     let stem = exe.trim_end_matches(".exe");
     let mut c = stem.chars();
     match c.next() {
@@ -266,14 +298,58 @@ impl eframe::App for App {
                 ui.add_space(8.0);
 
                 let s = &mut self.s;
+                let user_presets = &mut self.user_presets;
+                let preset_name = &mut self.preset_name;
+                card(ui, "PRESETS", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for p in crate::presets::builtin() {
+                            if ui.button(&p.name).clicked() {
+                                *s = crate::presets::apply(s, &p.settings);
+                            }
+                        }
+                    });
+                    let mut remove = None;
+                    if !user_presets.is_empty() {
+                        ui.label(RichText::new("Yours").color(MUTED).size(12.0));
+                        ui.horizontal_wrapped(|ui| {
+                            for (i, p) in user_presets.iter().enumerate() {
+                                if ui.button(&p.name).clicked() {
+                                    *s = crate::presets::apply(s, &p.settings);
+                                }
+                                if ui.small_button("✕").on_hover_text("Delete this preset").clicked() {
+                                    remove = Some(i);
+                                }
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        user_presets.remove(i);
+                        crate::presets::save_user(user_presets);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(preset_name).hint_text("Name your look").desired_width(ui.available_width() - 120.0));
+                        let name = preset_name.trim().to_string();
+                        if ui.add_enabled(!name.is_empty(), egui::Button::new("Save current")).clicked() {
+                            user_presets.retain(|p| p.name != name);
+                            user_presets.push(crate::presets::Preset { name, settings: s.clone() });
+                            crate::presets::save_user(user_presets);
+                            preset_name.clear();
+                        }
+                    });
+                    ui.label(
+                        RichText::new("A preset changes the look and effects only. Ctrl+Alt+P flips through them.").color(MUTED).size(12.0),
+                    );
+                });
+
                 let apps = &mut self.apps;
                 let mode = self.status.audio_mode.clone();
                 card(ui, "LISTEN TO", |ui| {
-                    let mut opts: Vec<(String, String)> = vec![(String::new(), "All apps".into())];
+                    let mut opts: Vec<(String, String)> =
+                        vec![(String::new(), "All apps".into()), (crate::audio::MIC.to_string(), "Microphone (live / instruments)".into())];
                     for a in apps.iter() {
                         opts.push((a.clone(), pretty_app(a)));
                     }
-                    if !s.audio_app.is_empty() && !apps.contains(&s.audio_app) {
+                    if !s.audio_app.is_empty() && s.audio_app != crate::audio::MIC && !apps.contains(&s.audio_app) {
                         opts.push((s.audio_app.clone(), pretty_app(&s.audio_app)));
                     }
                     let refs: Vec<(&str, &str)> = opts.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
@@ -290,6 +366,7 @@ impl eframe::App for App {
                         let app = pretty_app(&s.audio_app);
                         let (text, color) = match mode.as_str() {
                             "isolated" => (format!("Only {app}'s sound moves the bars ✓"), GREEN),
+                            "mic" => ("Listening to your microphone ✓ (song text still follows what's playing)".to_string(), GREEN),
                             "follow" => (
                                 format!("This Windows version can't capture one app on its own, so the bars follow {app}'s volume. Other sounds playing at the same time still mix in."),
                                 WARN,
@@ -320,6 +397,7 @@ impl eframe::App for App {
                     );
                     theme_rows(ui, "Edge colors", &mut s.edge_theme, &mut s.edge_color_a, &mut s.edge_color_b);
                     theme_rows(ui, "Circle colors", &mut s.circle_theme, &mut s.circle_color_a, &mut s.circle_color_b);
+                    toggle(ui, "Album cover in the circle", &mut s.album_art);
                     row(ui, "FPS limit", |ui| {
                         let name = |f: u32| if f == 0 { "Match screen".to_string() } else { format!("{f} FPS") };
                         egui::ComboBox::new("fps", "").selected_text(name(s.fps)).width(180.0).show_ui(ui, |ui| {
@@ -348,6 +426,37 @@ impl eframe::App for App {
                             format!("{x:.1}x")
                         }
                     });
+                });
+
+                let monitors = self.monitors;
+                card(ui, "SCREENS", |ui| {
+                    let mut opts: Vec<(&str, &str)> = vec![("main", "Main screen")];
+                    if monitors >= 2 {
+                        opts.push(("2", "Screen 2"));
+                    }
+                    if monitors >= 3 {
+                        opts.push(("3", "Screen 3"));
+                    }
+                    if monitors >= 2 {
+                        opts.push(("all", "All screens (mirrored)"));
+                    }
+                    if !opts.iter().any(|o| o.0 == s.display) {
+                        s.display = "main".into();
+                    }
+                    combo(ui, "Show on", &mut s.display, &opts);
+                    toggle(ui, "Wallpaper mode (behind desktop icons)", &mut s.wallpaper);
+                    toggle(ui, "OBS window", &mut s.obs_window);
+                    if s.obs_window {
+                        combo(ui, "OBS background", &mut s.obs_bg, &[("green", "Green (chroma key)"), ("black", "Black")]);
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Wallpaper mode draws on your desktop background, so apps cover it. \
+                             The OBS window can be added in OBS as a Window Capture; key out the green with a Chroma Key filter.",
+                        )
+                        .color(MUTED)
+                        .size(12.0),
+                    );
                 });
 
                 let status = &self.status;
@@ -390,6 +499,14 @@ impl eframe::App for App {
                         });
                     ui.add_space(4.0);
 
+                    combo(
+                        ui,
+                        "Lyrics style",
+                        &mut s.lyrics_style,
+                        &[("pop", "Pop in"), ("karaoke", "Karaoke (fills as it's sung)"), ("slide", "Slide in")],
+                    );
+                    toggle(ui, "Bigger text on the chorus", &mut s.chorus_big);
+                    toggle(ui, "Show BPM + beat counter (top right)", &mut s.show_bpm);
                     color_row(ui, "Text color", &mut s.text_color);
                     combo(
                         ui,
@@ -431,18 +548,47 @@ impl eframe::App for App {
                     );
                     toggle(ui, "Peak caps", &mut s.fx_peaks);
                     let off_pct = |x: f64| if x < 0.01 { "Off".to_string() } else { pct(x) };
+                    ui.label(RichText::new("Each effect can react to a different part of the song.").color(MUTED).size(12.0));
                     slider(ui, "Beat glow (screen edges light up)", &mut s.fx_glow, 0.0..=1.0, off_pct);
-                    slider(ui, "Bass shake", &mut s.fx_shake, 0.0..=1.0, off_pct);
+                    if s.fx_glow > 0.0 {
+                        trig(ui, "t_glow", &mut s.trig_glow);
+                    }
+                    slider(ui, "Screen shake", &mut s.fx_shake, 0.0..=1.0, off_pct);
+                    if s.fx_shake > 0.0 {
+                        trig(ui, "t_shake", &mut s.trig_shake);
+                    }
                     slider(ui, "RGB split glitch", &mut s.fx_glitch, 0.0..=1.0, off_pct);
+                    if s.fx_glitch > 0.0 {
+                        trig(ui, "t_glitch", &mut s.trig_glitch);
+                    }
                     slider(ui, "Particles", &mut s.fx_particles, 0.0..=1.0, off_pct);
+                    if s.fx_particles > 0.0 {
+                        trig(ui, "t_particles", &mut s.trig_particles);
+                    }
+                    slider(ui, "Bass ripple (shockwave rings)", &mut s.fx_ripple, 0.0..=1.0, off_pct);
+                    if s.fx_ripple > 0.0 {
+                        trig(ui, "t_ripple", &mut s.trig_ripple);
+                    }
                     slider(ui, "Afterglow trails", &mut s.fx_trails, 0.0..=0.9, off_pct);
                     slider(ui, "Circle spin", &mut s.circle_spin, -1.0..=1.0, |x| {
                         if x.abs() < 0.02 { "Off".into() } else if x > 0.0 { format!("→ {:.0}%", x * 100.0) } else { format!("← {:.0}%", -x * 100.0) }
                     });
                     slider(ui, "Circle bass zoom", &mut s.circle_zoom, 0.0..=1.0, off_pct);
+                    if s.circle_zoom > 0.0 {
+                        trig(ui, "t_zoom", &mut s.trig_zoom);
+                    }
+                    row(ui, "Kaleidoscope (circle copies)", |ui| {
+                        let name = |k: u32| if k == 0 { "Off".to_string() } else { format!("{k} copies") };
+                        egui::ComboBox::new("kaleido", "").selected_text(name(s.kaleido)).width(180.0).show_ui(ui, |ui| {
+                            for k in [0u32, 3, 4, 6] {
+                                ui.selectable_value(&mut s.kaleido, k, name(k));
+                            }
+                        });
+                    });
                     slider(ui, "Hyperspace (stars)", &mut s.hyperspace, 0.0..=1.0, off_pct);
                     if s.hyperspace > 0.0 {
                         slider(ui, "Warp speed", &mut s.hyper_speed, 0.0..=1.0, pct);
+                        trig(ui, "t_warp", &mut s.trig_warp);
                         combo(ui, "Hyperspace style", &mut s.hyper_style, &[("straight", "Straight (lightspeed)"), ("wormhole", "Wormhole")]);
                         if s.hyper_style == "wormhole" {
                             slider(ui, "Wormhole bend", &mut s.worm_bend, 0.0..=1.0, pct);
@@ -453,11 +599,15 @@ impl eframe::App for App {
                     slider(ui, "Orbiting stars", &mut s.orbit_stars, 0..=8, |x| if x < 0.5 { "Off".into() } else { format!("{x:.0}") });
                     if s.orbit_stars > 0 {
                         slider(ui, "Orbit speed", &mut s.orbit_speed, 0.0..=1.0, pct);
+                        trig(ui, "t_orbit", &mut s.trig_orbit);
                         toggle(ui, "Orbit stars match circle colors", &mut s.orbit_follow);
                     }
                     slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
                     ui.label(
-                        RichText::new("Beat effects react to kick drums. Beat glow and glitch flash on the beat: turn them down if flashing bothers you.")
+                        RichText::new(
+                            "Kick / bass = drum hits. Big drops = only the heaviest bass. Singing = the voice while lyrics are sung. \
+                             Hi-hats & snares = the sharp high hits. Beat glow and glitch flash: turn them down if flashing bothers you.",
+                        )
                             .color(MUTED)
                             .size(12.0),
                     );
@@ -468,6 +618,7 @@ impl eframe::App for App {
                     toggle(ui, "Flash RGB on the beat", &mut s.rgb_enabled);
                     if s.rgb_enabled {
                         combo(ui, "Effect", &mut s.rgb_effect, &[("flash", "Flash"), ("ripple", "Ripple (per-key keyboards)")]);
+                        trig(ui, "t_rgb", &mut s.trig_rgb);
                         toggle(ui, "Match edge colors", &mut s.rgb_follow);
                         if !s.rgb_follow {
                             color_row(ui, "Flash color", &mut s.rgb_color);
@@ -522,6 +673,7 @@ impl eframe::App for App {
                             ("Ctrl+Alt+C", "Switch colors"),
                             ("Ctrl+Alt+T", "Song text on / off"),
                             ("Ctrl+Alt+Up / Down", "Intensity up / down"),
+                            ("Ctrl+Alt+P", "Next preset"),
                         ] {
                             ui.label(RichText::new(k).monospace().size(12.0));
                             ui.label(RichText::new(d).color(MUTED).size(12.5));
