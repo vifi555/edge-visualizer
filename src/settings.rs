@@ -41,7 +41,8 @@ pub struct Settings {
     pub hyper_follow: bool,  // stars use the edge colours instead of white
     pub hyper_style: String, // straight | wormhole
     pub worm_bend: f32,      // 0..1 how far the wormhole bends
-    pub worm_rings: bool,    // glowing tunnel rings
+    #[serde(rename = "tunnelRings")]
+    pub worm_rings: bool, // glowing tunnel rings (off by default)
     pub orbit_stars: u32,    // 0..8 stars circling the middle (0 = off)
     pub orbit_speed: f32,    // 0..1
     pub orbit_follow: bool,  // orbit stars use the circle colours instead of white
@@ -100,7 +101,7 @@ impl Default for Settings {
             hyper_follow: false,
             hyper_style: "straight".into(),
             worm_bend: 0.6,
-            worm_rings: true,
+            worm_rings: false,
             orbit_stars: 0,
             orbit_speed: 0.5,
             orbit_follow: false,

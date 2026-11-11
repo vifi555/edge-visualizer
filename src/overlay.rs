@@ -208,6 +208,7 @@ struct Gfx {
     red: ID2D1Effect,  // RGB split: red channel only
     blue: ID2D1Effect, // RGB split: blue channel only
     round: ID2D1StrokeStyle1,
+    factory: ID2D1Factory1,
     trails: RefCell<[Option<ID2D1Bitmap1>; 2]>,
     trail_idx: Cell<usize>,
     trail_fresh: Cell<bool>,
@@ -333,6 +334,7 @@ impl Gfx {
                 red,
                 blue,
                 round,
+                factory: factory.clone(),
                 trails: RefCell::new([None, None]),
                 trail_idx: Cell::new(0),
                 trail_fresh: Cell::new(true),
@@ -602,25 +604,65 @@ impl Gfx {
     }
 
     /// Hyperspace: stars streaking out from the centre of the screen.
-    /// Wormhole mode: the centre bends around (far things follow it, near things stay
-    /// in the middle, so streaks curve), the field rolls, and tunnel rings rush past.
-    fn draw_hyperspace(&self, fx: &Fx, s: &Settings, t: f32) {
+    /// Wormhole mode: every streak is a short curve that follows the tunnel's bend and
+    /// spirals around you. Stars are grouped by brightness and each group is drawn as
+    /// ONE path (a handful of draw calls instead of hundreds), and they're drawn once,
+    /// outside the glow blur.
+    fn draw_hyperspace(&self, fx: &Fx, s: &Settings, t: f32) -> Result<()> {
         if fx.stars.is_empty() || fx.hyper_vis <= 0.01 {
-            return;
+            return Ok(());
         }
         let (cx, cy) = (self.w / 2.0, self.h / 2.0);
         let f = self.h / 2.0; // y = ±1 reaches the top/bottom edge
         let thick = (self.w.min(self.h) / 540.0).max(1.0);
+        let worm = s.hyper_style == "wormhole";
         // the tunnel's centre at depth z
         let centre = |z: f32| (cx + fx.worm_off.0 * f * z, cy + fx.worm_off.1 * f * z);
-        let (rc, rs) = (fx.roll.cos(), fx.roll.sin());
+        // spiral: deeper = more rotated, so stars swirl as they come at you
+        let swirl = if worm { 0.5 + 1.8 * s.worm_bend } else { 0.0 };
+        let samples = if worm { 6 } else { 2 };
         // longer streaks the faster we go
-        let streak = 0.02 + fx.hyper_speed * 0.06;
+        let streak = if worm {
+            0.04 + fx.hyper_speed * 0.10
+        } else {
+            0.02 + fx.hyper_speed * 0.06
+        };
         let pal = palette(s, false);
+        const LEVELS: usize = 8;
+        let hues = if s.hyper_follow { 6 } else { 1 };
+        let mut groups: Vec<Vec<Vec<D2D_POINT_2F>>> = vec![Vec::new(); LEVELS * hues];
+        let level_alpha = |lv: usize| ((lv as f32 + 0.5) / LEVELS as f32).powf(1.5) * fx.hyper_vis * s.opacity;
+
+        for st in &fx.stars {
+            let z1 = st.z.max(0.03);
+            let z0 = (st.pz.max(z1) + streak).min(1.0);
+            let near = (1.0 - z1).clamp(0.0, 1.0);
+            let lv = ((near * LEVELS as f32) as usize).min(LEVELS - 1);
+            if level_alpha(lv) < 0.02 {
+                continue;
+            }
+            let hue = if hues > 1 {
+                (((st.y.atan2(st.x) / std::f32::consts::TAU) + 0.5) * hues as f32) as usize % hues
+            } else {
+                0
+            };
+            let pts: Vec<D2D_POINT_2F> = (0..samples)
+                .map(|k| {
+                    let z = z0 + (z1 - z0) * k as f32 / (samples - 1) as f32; // tail -> head
+                    let a = fx.roll + swirl * z;
+                    let (c, sn) = (a.cos(), a.sin());
+                    let (x, y) = (st.x * c - st.y * sn, st.x * sn + st.y * c);
+                    let ce = centre(z);
+                    pt(ce.0 + x / z * f, ce.1 + y / z * f)
+                })
+                .collect();
+            groups[lv * hues + hue].push(pts);
+        }
+
         unsafe {
             self.brush.SetOpacity(1.0);
 
-            // tunnel rings (far to near)
+            // optional tunnel rings (far to near)
             let mut order: Vec<(usize, f32)> = fx.rings.iter().copied().enumerate().collect();
             order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (i, z) in order {
@@ -653,30 +695,32 @@ impl Gfx {
                     .DrawEllipse(&e, &self.brush, thick * (1.0 + 4.0 * near), None::<&ID2D1StrokeStyle>);
             }
 
-            for st in &fx.stars {
-                let z1 = st.z.max(0.03);
-                let z0 = (st.pz.max(z1) + streak).min(1.0);
-                let (x, y) = (st.x * rc - st.y * rs, st.x * rs + st.y * rc); // roll
-                let (c1, c0) = (centre(z1), centre(z0));
-                let (x1, y1) = (c1.0 + x / z1 * f, c1.1 + y / z1 * f);
-                let (x0, y0) = (c0.0 + x / z0 * f, c0.1 + y / z0 * f);
-                let near = (1.0 - z1).clamp(0.0, 1.0);
-                let a = near.powf(1.5) * fx.hyper_vis * s.opacity;
-                if a < 0.02 {
+            for (gi, figs) in groups.iter().enumerate() {
+                if figs.is_empty() {
                     continue;
                 }
+                let (lv, hue) = (gi / hues, gi % hues);
+                let near = (lv as f32 + 0.5) / LEVELS as f32;
                 let c = if s.hyper_follow {
-                    bar_color(&pal, t, st.x, st.y)
+                    let a = (hue as f32 + 0.5) / hues as f32 * std::f32::consts::TAU - std::f32::consts::PI;
+                    bar_color(&pal, t, a.cos(), a.sin())
                 } else {
-                    // white, with a faint blue tint on far stars
                     col(0.85 + 0.15 * near, 0.9 + 0.1 * near, 1.0, 1.0)
                 };
-                self.brush.SetColor(&col(c.r, c.g, c.b, a));
-                self.dc
-                    .DrawLine(pt(x0, y0), pt(x1, y1), &self.brush, thick * (0.4 + 2.2 * near), &self.round);
+                let geom = self.factory.CreatePathGeometry()?;
+                let sink = geom.Open()?;
+                for fig in figs {
+                    sink.BeginFigure(fig[0], D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink.AddLines(&fig[1..]);
+                    sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                }
+                sink.Close()?;
+                self.brush.SetColor(&col(c.r, c.g, c.b, level_alpha(lv)));
+                self.dc.DrawGeometry(&geom, &self.brush, thick * (0.4 + 2.2 * near), &self.round);
             }
             self.brush.SetOpacity(s.opacity);
         }
+        Ok(())
     }
 
     /// Stars circling the middle, each a twinkling 4-point sparkle with a fading tail.
@@ -1010,7 +1054,6 @@ fn render(
         g.dc.Clear(Some(&clear));
         g.brush.SetOpacity(s.opacity);
         fx.tips.clear();
-        g.draw_hyperspace(fx, s, t);
         g.draw_orbit(fx, s, t, an.bass());
         if !an.cur.is_empty() {
             if s.mode != "circle" {
@@ -1064,6 +1107,7 @@ fn render(
         g.dc.BeginDraw();
         g.dc.Clear(Some(&clear));
         let (sx, sy) = fx.shake();
+        let hyper_res = g.draw_hyperspace(fx, s, t);
         let off = pt(sx, sy);
         if s.glow > 0.5 {
             let sigma = s.glow * 0.5 * dpi;
@@ -1108,6 +1152,7 @@ fn render(
         let toast_res = draw_toast(g, toast, dpi);
         g.dc.EndDraw(None, None)?;
         glow_res?;
+        hyper_res?;
         toast_res?;
         g.swap.Present(1, DXGI_PRESENT(0)).ok()?;
     }

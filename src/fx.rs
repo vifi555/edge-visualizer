@@ -208,7 +208,7 @@ impl Fx {
     /// Hyperspace: stars fly towards you; bass speeds them up and kicks punch into warp.
     /// `playing` = is there sound right now; `aspect` = screen width / height.
     pub fn update_hyper(&mut self, dt: f32, hit: bool, bass: f32, playing: bool, aspect: f32, s: &Settings) {
-        let want = (s.hyperspace * 900.0).round() as usize;
+        let want = (s.hyperspace * 600.0).round() as usize;
         if want == 0 {
             self.stars.clear();
             self.hyper_vis = 0.0;
