@@ -440,6 +440,11 @@ impl eframe::App for App {
                         if x.abs() < 0.02 { "Off".into() } else if x > 0.0 { format!("→ {:.0}%", x * 100.0) } else { format!("← {:.0}%", -x * 100.0) }
                     });
                     slider(ui, "Circle bass zoom", &mut s.circle_zoom, 0.0..=1.0, off_pct);
+                    slider(ui, "Hyperspace (stars)", &mut s.hyperspace, 0.0..=1.0, off_pct);
+                    if s.hyperspace > 0.0 {
+                        slider(ui, "Warp speed", &mut s.hyper_speed, 0.0..=1.0, pct);
+                        toggle(ui, "Stars match edge colors", &mut s.hyper_follow);
+                    }
                     slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
                     ui.label(
                         RichText::new("Beat effects react to kick drums. Beat glow and glitch flash on the beat: turn them down if flashing bothers you.")

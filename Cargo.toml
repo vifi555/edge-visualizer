@@ -1,6 +1,6 @@
 [package]
 name = "edge-visualizer"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 description = "Music visualizer bars around the edges of your screen, with synced lyrics"
 

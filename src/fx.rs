@@ -25,6 +25,14 @@ pub struct Particle {
     pub color: (f32, f32, f32),
 }
 
+/// One star of the hyperspace field: x/y in screen units around the centre, z = depth (1 far, 0 at you).
+pub struct Star {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub pz: f32, // depth last frame (for the streak)
+}
+
 pub struct Fx {
     rng: u32,
     pub tips: Vec<Tip>,
@@ -37,6 +45,10 @@ pub struct Fx {
     pub glitch: f32, // 0..1, RGB split strength right now
     pub glow: f32,   // 0..1, beat glow strength right now
     pub punch: f32,  // 0..1, circle bass zoom right now
+    pub stars: Vec<Star>,
+    pub warp: f32,      // 0..1, extra speed right after a kick
+    pub hyper_vis: f32, // 0..1, stars fade in with music and out in silence
+    pub hyper_speed: f32,
 }
 
 const MAX_PARTICLES: usize = 600;
@@ -55,6 +67,10 @@ impl Fx {
             glitch: 0.0,
             glow: 0.0,
             punch: 0.0,
+            stars: Vec::new(),
+            warp: 0.0,
+            hyper_vis: 0.0,
+            hyper_speed: 0.0,
         }
     }
 
@@ -161,9 +177,66 @@ impl Fx {
         (self.shake_dir.0 * k, self.shake_dir.1 * k)
     }
 
+    fn new_star(&mut self, aspect: f32, z: f32) -> Star {
+        loop {
+            let x = (self.rand() * 2.0 - 1.0) * aspect;
+            let y = self.rand() * 2.0 - 1.0;
+            if x.abs() + y.abs() > 0.06 {
+                // not dead centre (those would sit still)
+                return Star { x, y, z, pz: z };
+            }
+        }
+    }
+
+    /// Hyperspace: stars fly towards you; bass speeds them up and kicks punch into warp.
+    /// `playing` = is there sound right now; `aspect` = screen width / height.
+    pub fn update_hyper(&mut self, dt: f32, hit: bool, bass: f32, playing: bool, aspect: f32, s: &Settings) {
+        let want = (s.hyperspace * 900.0).round() as usize;
+        if want == 0 {
+            self.stars.clear();
+            self.hyper_vis = 0.0;
+            return;
+        }
+        while self.stars.len() < want {
+            let z = 0.05 + self.rand() * 0.95; // spread out so it doesn't start as a wall
+            let st = self.new_star(aspect, z);
+            self.stars.push(st);
+        }
+        self.stars.truncate(want);
+
+        let target = if playing { 1.0 } else { 0.0 };
+        let step = dt / 0.8;
+        self.hyper_vis = if self.hyper_vis < target {
+            (self.hyper_vis + step).min(1.0)
+        } else {
+            (self.hyper_vis - step).max(0.0)
+        };
+        if hit {
+            self.warp = 1.0;
+        }
+        self.warp *= (-dt / 0.35).exp();
+
+        // depth units per second
+        self.hyper_speed = (0.12 + 0.9 * s.hyper_speed) * (0.35 + 1.4 * bass + 2.6 * self.warp) * self.hyper_vis;
+        for i in 0..self.stars.len() {
+            let st = &mut self.stars[i];
+            st.pz = st.z;
+            st.z -= self.hyper_speed * dt;
+            let gone = st.z <= 0.03 || (st.x / st.z).abs() > aspect * 1.05 || (st.y / st.z).abs() > 1.05;
+            if gone {
+                self.stars[i] = self.new_star(aspect, 1.0);
+            }
+        }
+    }
+
     /// Is anything still moving? (so "sleep when silent" waits for it)
     pub fn active(&self) -> bool {
         let (x, y) = self.shake();
-        !self.particles.is_empty() || self.glitch > 0.01 || self.glow > 0.01 || self.punch > 0.01 || x.abs() + y.abs() > 0.3
+        !self.particles.is_empty()
+            || self.glitch > 0.01
+            || self.glow > 0.01
+            || self.punch > 0.01
+            || x.abs() + y.abs() > 0.3
+            || (self.hyper_vis > 0.01 && !self.stars.is_empty())
     }
 }

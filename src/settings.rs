@@ -27,15 +27,18 @@ pub struct Settings {
     pub rgb_sensitivity: f32, // 0..1, higher = more beats
     pub rgb_corsair: bool,
     pub rgb_steelseries: bool,
-    pub bar_style: String, // bars | rounded | dots | line
-    pub fx_peaks: bool,    // little caps that fall slowly
-    pub fx_glow: f32,      // 0..1 beat glow around the screen
-    pub fx_shake: f32,     // 0..1 bass shake
-    pub fx_glitch: f32,    // 0..1 RGB split on the beat
-    pub fx_particles: f32, // 0..1 sparks from the bars
-    pub fx_trails: f32,    // 0..1 afterglow trails
-    pub circle_spin: f32,  // -1..1 rotation speed
-    pub circle_zoom: f32,  // 0..1 bass punch
+    pub bar_style: String,  // bars | rounded | dots | line
+    pub fx_peaks: bool,     // little caps that fall slowly
+    pub fx_glow: f32,       // 0..1 beat glow around the screen
+    pub fx_shake: f32,      // 0..1 bass shake
+    pub fx_glitch: f32,     // 0..1 RGB split on the beat
+    pub fx_particles: f32,  // 0..1 sparks from the bars
+    pub fx_trails: f32,     // 0..1 afterglow trails
+    pub circle_spin: f32,   // -1..1 rotation speed
+    pub circle_zoom: f32,   // 0..1 bass punch
+    pub hyperspace: f32,    // 0..1 star amount (0 = off)
+    pub hyper_speed: f32,   // 0..1 warp speed
+    pub hyper_follow: bool, // stars use the edge colours instead of white
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -86,6 +89,9 @@ impl Default for Settings {
             fx_trails: 0.0,
             circle_spin: 0.0,
             circle_zoom: 0.0,
+            hyperspace: 0.0,
+            hyper_speed: 0.5,
+            hyper_follow: false,
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -195,6 +201,8 @@ impl Settings {
         }
         self.fx_trails = self.fx_trails.clamp(0.0, 0.9);
         self.circle_spin = self.circle_spin.clamp(-1.0, 1.0);
+        self.hyperspace = self.hyperspace.clamp(0.0, 1.0);
+        self.hyper_speed = self.hyper_speed.clamp(0.0, 1.0);
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);

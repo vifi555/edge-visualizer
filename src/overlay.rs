@@ -601,6 +601,43 @@ impl Gfx {
         }
     }
 
+    /// Hyperspace: stars streaking out from the centre of the screen.
+    fn draw_hyperspace(&self, fx: &Fx, s: &Settings, t: f32) {
+        if fx.stars.is_empty() || fx.hyper_vis <= 0.01 {
+            return;
+        }
+        let (cx, cy) = (self.w / 2.0, self.h / 2.0);
+        let f = self.h / 2.0; // y = ±1 reaches the top/bottom edge
+        let thick = (self.w.min(self.h) / 540.0).max(1.0);
+        // longer streaks the faster we go
+        let streak = 0.02 + fx.hyper_speed * 0.06;
+        let pal = palette(s, false);
+        unsafe {
+            self.brush.SetOpacity(1.0);
+            for st in &fx.stars {
+                let z1 = st.z.max(0.03);
+                let z0 = (st.pz.max(z1) + streak).min(1.0);
+                let (x1, y1) = (cx + st.x / z1 * f, cy + st.y / z1 * f);
+                let (x0, y0) = (cx + st.x / z0 * f, cy + st.y / z0 * f);
+                let near = (1.0 - z1).clamp(0.0, 1.0);
+                let a = near.powf(1.5) * fx.hyper_vis * s.opacity;
+                if a < 0.02 {
+                    continue;
+                }
+                let c = if s.hyper_follow {
+                    bar_color(&pal, t, st.x, st.y)
+                } else {
+                    // white, with a faint blue tint on far stars
+                    col(0.85 + 0.15 * near, 0.9 + 0.1 * near, 1.0, 1.0)
+                };
+                self.brush.SetColor(&col(c.r, c.g, c.b, a));
+                self.dc
+                    .DrawLine(pt(x0, y0), pt(x1, y1), &self.brush, thick * (0.4 + 2.2 * near), &self.round);
+            }
+            self.brush.SetOpacity(s.opacity);
+        }
+    }
+
     /// Sparks flying out from the bars.
     fn draw_particles(&self, fx: &Fx, s: &Settings) {
         unsafe {
@@ -871,6 +908,7 @@ fn render(
         g.dc.Clear(Some(&clear));
         g.brush.SetOpacity(s.opacity);
         fx.tips.clear();
+        g.draw_hyperspace(fx, s, t);
         if !an.cur.is_empty() {
             if s.mode != "circle" {
                 g.draw_edge(&an.cur, s, t, &fx.peaks, &mut fx.tips);
@@ -1329,6 +1367,8 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
             feed_rgb(&rgb, &beat, hit, &s, start.elapsed().as_secs_f32());
         }
         fx.update(dt, hit, &an.cur, &s, dpi);
+        let playing = an.cur.iter().any(|&v| v > 0.01);
+        fx.update_hyper(dt, hit, an.bass(), playing, sw as f32 / sh.max(1) as f32, &s);
 
         // ---- text
         let (main, sub, lyric) = pick_text(track.as_ref(), &ly, &s);
