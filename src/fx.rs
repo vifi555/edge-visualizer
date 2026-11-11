@@ -49,6 +49,9 @@ pub struct Fx {
     pub warp: f32,      // 0..1, extra speed right after a kick
     pub hyper_vis: f32, // 0..1, stars fade in with music and out in silence
     pub hyper_speed: f32,
+    pub orbit_angle: f32, // where the orbiting stars are
+    pub orbit_kick: f32,  // 0..1, flare + speed burst right after a kick
+    pub orbit_vis: f32,   // 0..1, fade with the music
 }
 
 const MAX_PARTICLES: usize = 600;
@@ -71,6 +74,9 @@ impl Fx {
             warp: 0.0,
             hyper_vis: 0.0,
             hyper_speed: 0.0,
+            orbit_angle: 0.0,
+            orbit_kick: 0.0,
+            orbit_vis: 0.0,
         }
     }
 
@@ -229,6 +235,28 @@ impl Fx {
         }
     }
 
+    /// Orbiting stars: circle around the middle, speed up and flare on every kick.
+    pub fn update_orbit(&mut self, dt: f32, hit: bool, playing: bool, s: &Settings) {
+        if s.orbit_stars == 0 {
+            self.orbit_vis = 0.0;
+            return;
+        }
+        let target = if playing { 1.0 } else { 0.0 };
+        let step = dt / 0.8;
+        self.orbit_vis = if self.orbit_vis < target {
+            (self.orbit_vis + step).min(1.0)
+        } else {
+            (self.orbit_vis - step).max(0.0)
+        };
+        if hit {
+            self.orbit_kick = 1.0;
+        }
+        self.orbit_kick *= (-dt / 0.3).exp();
+        // radians per second: a calm drift, whipping round on each kick
+        let speed = (0.5 + 0.5 * s.orbit_speed) * (0.6 + 5.0 * self.orbit_kick) * self.orbit_vis;
+        self.orbit_angle = (self.orbit_angle + speed * dt).rem_euclid(TAU);
+    }
+
     /// Is anything still moving? (so "sleep when silent" waits for it)
     pub fn active(&self) -> bool {
         let (x, y) = self.shake();
@@ -238,5 +266,6 @@ impl Fx {
             || self.punch > 0.01
             || x.abs() + y.abs() > 0.3
             || (self.hyper_vis > 0.01 && !self.stars.is_empty())
+            || self.orbit_vis > 0.01
     }
 }

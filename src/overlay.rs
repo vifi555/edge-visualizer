@@ -638,6 +638,67 @@ impl Gfx {
         }
     }
 
+    /// Stars circling the middle, each a twinkling 4-point sparkle with a fading tail.
+    fn draw_orbit(&self, fx: &Fx, s: &Settings, t: f32, bass: f32) {
+        let n = s.orbit_stars as usize;
+        if n == 0 || fx.orbit_vis <= 0.01 {
+            return;
+        }
+        let (cx, cy) = (self.w / 2.0, self.h / 2.0);
+        let min = self.w.min(self.h);
+        // just outside the circle visualizer's bars
+        let r = min * 0.17 * s.size * (1.0 + 0.06 * bass + 0.25 * fx.punch) + min * 0.16 * s.size * 0.8;
+        let base = min / 160.0 * (1.0 + 1.3 * fx.orbit_kick); // star size, flares on kicks
+        let pal = palette(s, true);
+        let tau = std::f32::consts::TAU;
+        unsafe {
+            self.brush.SetOpacity(1.0);
+            for i in 0..n {
+                let a = fx.orbit_angle + i as f32 * tau / n as f32;
+                let c = if s.orbit_follow {
+                    bar_color(&pal, t, a.cos(), a.sin())
+                } else {
+                    col(1.0, 0.97, 0.9, 1.0)
+                };
+                let vis = fx.orbit_vis * s.opacity;
+                // tail: fading dots behind the star (longer when it's whipping round)
+                let tail_len = 0.25 + 0.6 * fx.orbit_kick;
+                for k in 1..=20 {
+                    let f = k as f32 / 20.0;
+                    let ta = a - f * tail_len;
+                    let alpha = (1.0 - f) * 0.4 * vis;
+                    self.brush.SetColor(&col(c.r, c.g, c.b, alpha));
+                    let rad = base * 0.55 * (1.0 - f * 0.7);
+                    let e = D2D1_ELLIPSE {
+                        point: pt(cx + ta.cos() * r, cy + ta.sin() * r),
+                        radiusX: rad,
+                        radiusY: rad,
+                    };
+                    self.dc.FillEllipse(&e, &self.brush);
+                }
+                // the star: a 4-point sparkle that slowly twinkles/rotates, with a bright core
+                let (x, y) = (cx + a.cos() * r, cy + a.sin() * r);
+                let tw = t * 2.0 + i as f32;
+                let len = base * (2.6 + 0.4 * (t * 7.0 + i as f32).sin());
+                self.brush.SetColor(&col(c.r, c.g, c.b, vis));
+                for k in 0..2 {
+                    let ang = tw + k as f32 * std::f32::consts::FRAC_PI_2;
+                    let (dx, dy) = (ang.cos() * len, ang.sin() * len);
+                    self.dc
+                        .DrawLine(pt(x - dx, y - dy), pt(x + dx, y + dy), &self.brush, base * 0.45, &self.round);
+                }
+                self.brush.SetColor(&col(1.0, 1.0, 1.0, vis));
+                let core = D2D1_ELLIPSE {
+                    point: pt(x, y),
+                    radiusX: base * 0.7,
+                    radiusY: base * 0.7,
+                };
+                self.dc.FillEllipse(&core, &self.brush);
+            }
+            self.brush.SetOpacity(s.opacity);
+        }
+    }
+
     /// Sparks flying out from the bars.
     fn draw_particles(&self, fx: &Fx, s: &Settings) {
         unsafe {
@@ -909,6 +970,7 @@ fn render(
         g.brush.SetOpacity(s.opacity);
         fx.tips.clear();
         g.draw_hyperspace(fx, s, t);
+        g.draw_orbit(fx, s, t, an.bass());
         if !an.cur.is_empty() {
             if s.mode != "circle" {
                 g.draw_edge(&an.cur, s, t, &fx.peaks, &mut fx.tips);
@@ -1369,6 +1431,7 @@ pub fn run(updated_to: Option<String>) -> Result<()> {
         fx.update(dt, hit, &an.cur, &s, dpi);
         let playing = an.cur.iter().any(|&v| v > 0.01);
         fx.update_hyper(dt, hit, an.bass(), playing, sw as f32 / sh.max(1) as f32, &s);
+        fx.update_orbit(dt, hit, playing, &s);
 
         // ---- text
         let (main, sub, lyric) = pick_text(track.as_ref(), &ly, &s);

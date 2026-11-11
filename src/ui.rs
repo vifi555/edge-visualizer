@@ -445,6 +445,11 @@ impl eframe::App for App {
                         slider(ui, "Warp speed", &mut s.hyper_speed, 0.0..=1.0, pct);
                         toggle(ui, "Stars match edge colors", &mut s.hyper_follow);
                     }
+                    slider(ui, "Orbiting stars", &mut s.orbit_stars, 0..=8, |x| if x < 0.5 { "Off".into() } else { format!("{x:.0}") });
+                    if s.orbit_stars > 0 {
+                        slider(ui, "Orbit speed", &mut s.orbit_speed, 0.0..=1.0, pct);
+                        toggle(ui, "Orbit stars match circle colors", &mut s.orbit_follow);
+                    }
                     slider(ui, "Beat sensitivity", &mut s.rgb_sensitivity, 0.0..=1.0, pct);
                     ui.label(
                         RichText::new("Beat effects react to kick drums. Beat glow and glitch flash on the beat: turn them down if flashing bothers you.")

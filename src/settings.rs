@@ -39,6 +39,9 @@ pub struct Settings {
     pub hyperspace: f32,    // 0..1 star amount (0 = off)
     pub hyper_speed: f32,   // 0..1 warp speed
     pub hyper_follow: bool, // stars use the edge colours instead of white
+    pub orbit_stars: u32,   // 0..8 stars circling the middle (0 = off)
+    pub orbit_speed: f32,   // 0..1
+    pub orbit_follow: bool, // orbit stars use the circle colours instead of white
     pub intensity: f32,
     pub size: f32,
     pub bars: u32,
@@ -92,6 +95,9 @@ impl Default for Settings {
             hyperspace: 0.0,
             hyper_speed: 0.5,
             hyper_follow: false,
+            orbit_stars: 0,
+            orbit_speed: 0.5,
+            orbit_follow: false,
             intensity: 1.0,
             size: 1.0,
             bars: 96,
@@ -203,6 +209,8 @@ impl Settings {
         self.circle_spin = self.circle_spin.clamp(-1.0, 1.0);
         self.hyperspace = self.hyperspace.clamp(0.0, 1.0);
         self.hyper_speed = self.hyper_speed.clamp(0.0, 1.0);
+        self.orbit_stars = self.orbit_stars.min(8);
+        self.orbit_speed = self.orbit_speed.clamp(0.0, 1.0);
         pick(&mut self.text_shows, &["lyrics", "both", "title"], "lyrics");
         pick(&mut self.text_font, &["clean", "impact", "mono", "script"], "clean");
         self.intensity = self.intensity.clamp(0.3, 3.0);
