@@ -1307,7 +1307,10 @@ fn build_words(
 fn spawn_shards(g: &Gfx, ts: &mut TextState, line: &IDWriteTextLayout, s: &Settings, dpi: f32) {
     let (family, weight, _) = font(s);
     let text = ts.lay_text.clone();
-    let size = unsafe { line.GetFontSize() };
+    let mut size = s.text_size * dpi;
+    unsafe {
+        let _ = line.GetFontSize(0, &mut size, None);
+    }
     let (tr, tg, tb) = settings::parse_hex(&s.text_color).unwrap_or((1.0, 1.0, 1.0));
     let (ax, ay) = ts.last_at;
     let mut metrics = DWRITE_TEXT_METRICS::default();
